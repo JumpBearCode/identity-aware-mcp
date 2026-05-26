@@ -1,0 +1,31 @@
+services:
+  mcp-server:
+    build: ./mcp-server
+    container_name: mcp-server
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      DIAGNOSE_WORKER_URL: http://diagnose-worker:9001
+      ACTION_WORKER_URL: http://action-worker:9002
+    depends_on:
+      - diagnose-worker
+      - action-worker
+
+  diagnose-worker:
+    build: ./diagnose-worker
+    container_name: diagnose-worker
+    environment:
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID}
+      AZURE_CLIENT_ID: ${DIAGNOSE_SP_CLIENT_ID}
+      AZURE_CLIENT_SECRET: ${DIAGNOSE_SP_CLIENT_SECRET}
+      PORT: "9001"
+
+  action-worker:
+    build: ./action-worker
+    container_name: action-worker
+    environment:
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID}
+      AZURE_CLIENT_ID: ${ACTION_SP_CLIENT_ID}
+      AZURE_CLIENT_SECRET: ${ACTION_SP_CLIENT_SECRET}
+      PORT: "9002"
