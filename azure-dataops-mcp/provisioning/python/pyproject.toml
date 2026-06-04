@@ -1,10 +1,9 @@
 [project]
 name = "dataops-mcp-provision"
 version = "0.1.0"
-description = "Provision Entra apps, groups, SPs, and RBAC for the DataOps MCP stack."
+description = "Provision Entra apps, groups, and SPs for the DataOps MCP stack."
 requires-python = ">=3.11"
 dependencies = [
     "azure-identity>=1.19",
-    "azure-mgmt-authorization>=4.0",
     "msgraph-sdk>=1.7",
 ]

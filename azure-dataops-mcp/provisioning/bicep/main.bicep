@@ -5,31 +5,33 @@
 //
 // What this file does NOT do:
 //   - Create client secrets   (Bicep can't safely emit secrets — use write-env.sh after deploy)
-//   - Grant admin consent     (do it once in the Entra portal, or via `az ad app permission admin-consent`)
-//   - Add users to groups     (use `az ad group member add` per user)
+//   - Add users to groups      (use `az ad group member add` per user)
+//   - Grant any Azure RBAC     (worker SPs get NO resource access here — assign it yourself later)
 //
-// targetScope must be subscription so we can create role assignments at sub level.
+// targetScope = tenant: only Graph (apps/SPs/groups/grants) resources live here now.
 
-targetScope = 'subscription'
+targetScope = 'tenant'
 
 extension microsoftGraphV1
 
 @description('Display-name prefix for created resources (e.g. "dataops-mcp")')
 param name string = 'dataops-mcp'
 
-@description('Scope where the worker SPs receive RBAC. Default: the entire subscription.')
-param targetScope_ string = subscription().id
-
 @description('Client ID of VS Code (well-known). Override for tenants using a different MCP client.')
 param vscodeClientId string = 'aebc6443-996d-45c2-90f0-388ff96faa56'
 
-// --- Well-known role IDs ---
-var readerRoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
-var contributorRoleId = 'b24988ac-6180-42a0-ab88-20f7382dd24c'
-
 // --- Well-known IDs for Microsoft Graph ---
 var graphAppId = '00000003-0000-0000-c000-000000000000'
-var graphUserRead = 'e1fe6dd8-ba31-4d61-89e7-88639da4683d' // delegated User.Read
+
+// Delegated Graph permission IDs the MCP server requests (declared so they show in portal).
+var graphUserRead = 'e1fe6dd8-ba31-4d61-89e7-88639da4683d'
+var graphEmail = '64a6cdd6-aab1-4aaf-94b8-3cc8405e90d0'
+var graphOfflineAccess = '7427e0e9-2fba-42fe-b0c0-848c9e6a8182'
+var graphOpenid = '37f7f235-527c-4136-accd-4a02d197296e'
+var graphProfile = '14dad69e-099b-42c9-810b-d002981feec1'
+
+// Scope string the MCP server is admin-consented for (OBO -> Graph).
+var graphOboScope = 'User.Read email offline_access openid profile'
 
 // --- Scope GUID for user_impersonation on the MCP server app ---
 var userImpersonationScopeId = guid('${name}-mcp-server-user_impersonation')
@@ -49,6 +51,10 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
       resourceAppId: graphAppId
       resourceAccess: [
         { id: graphUserRead, type: 'Scope' }
+        { id: graphEmail, type: 'Scope' }
+        { id: graphOfflineAccess, type: 'Scope' }
+        { id: graphOpenid, type: 'Scope' }
+        { id: graphProfile, type: 'Scope' }
       ]
     }
   ]
@@ -77,6 +83,20 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
 
 resource mcpServerSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
   appId: mcpServerApp.appId
+}
+
+// Microsoft Graph's own SP in this tenant — needed as the grant's resource.
+resource graphSp 'Microsoft.Graph/servicePrincipals@v1.0' existing = {
+  appId: graphAppId
+}
+
+// Admin consent for OBO -> Graph (tenant-wide delegated grant), so OBO works
+// with no per-user consent screen during MCP sign-in.
+resource oboGrant 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = {
+  clientId: mcpServerSp.id
+  consentType: 'AllPrincipals'
+  resourceId: graphSp.id
+  scope: graphOboScope
 }
 
 // =====================================================================
@@ -121,20 +141,7 @@ resource actionSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
   appId: actionSpApp.appId
 }
 
-// =====================================================================
-//  RBAC at targetScope_
-// =====================================================================
-module rbac './rbac.bicep' = {
-  name: 'rbac'
-  scope: subscription()
-  params: {
-    diagnoseSpObjectId: diagnoseSp.id
-    actionSpObjectId: actionSp.id
-    readerRoleId: readerRoleId
-    contributorRoleId: contributorRoleId
-    scope_: targetScope_
-  }
-}
+// Worker SPs intentionally receive NO Azure RBAC here — grant access later.
 
 // =====================================================================
 //  Outputs (consumed by write-env.sh to assemble .env)

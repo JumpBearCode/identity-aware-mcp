@@ -3,7 +3,7 @@
 # three app registrations, and writes ../../.env consumed by docker-compose.
 #
 # Usage:
-#   AZURE_SUBSCRIPTION_ID=...  AZURE_TENANT_ID=...  ./write-env.sh <deployment-name>
+#   ./write-env.sh <deployment-name>
 #
 # Idempotency: `az ad app credential reset` invalidates prior secrets — only run once,
 # or rotate by re-running and updating .env on all consumers.
@@ -19,7 +19,7 @@ if [[ -f "$ENV_OUT" ]]; then
 fi
 
 echo "==> Reading deployment outputs..."
-outputs=$(az deployment sub show -n "$DEPLOYMENT_NAME" --query properties.outputs -o json)
+outputs=$(az deployment tenant show -n "$DEPLOYMENT_NAME" --query properties.outputs -o json)
 mcp_app_id=$(jq -r '.MCP_APP_ID.value' <<<"$outputs")
 diag_group=$(jq -r '.DIAGNOSE_GROUP_ID.value' <<<"$outputs")
 act_group=$(jq -r '.ACTION_GROUP_ID.value' <<<"$outputs")
@@ -50,6 +50,6 @@ echo "Done. Next:"
 echo "  1. Add users to the AD groups:"
 echo "       az ad group member add --group $diag_group --member-id <user-object-id>"
 echo "       az ad group member add --group $act_group  --member-id <user-object-id>"
-echo "  2. Admin-consent the MCP server app (Graph User.Read for OBO):"
-echo "       az ad app permission admin-consent --id $mcp_app_id"
+echo "  2. Grant the worker SPs whatever Azure RBAC they need — none is assigned yet."
 echo "  3. docker compose up --build"
+echo "  (OBO admin consent is already granted in main.bicep.)"

@@ -7,20 +7,16 @@ Same end-state as the Python SDK route, declarative.
 - Azure CLI ≥ 2.62 (Bicep extensibility + `Microsoft.Graph` extension)
 - `az login` as a principal with:
   - Entra: **Application Administrator** + **Group Administrator**
-  - Azure: **Owner** / **User Access Administrator** on the target scope
+  - **Privileged Role Administrator** / **Global Admin** for the OBO admin-consent grant
 - `jq`
 
 ## Deploy
 
 ```bash
-# Optional: override the RBAC scope (defaults to the whole subscription)
-SCOPE="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/<rg>"
-
-az deployment sub create \
+az deployment tenant create \
   --name dataops-mcp-provision \
   --location eastus \
-  --template-file main.bicep \
-  --parameters targetScope_="$SCOPE"
+  --template-file main.bicep
 
 ./write-env.sh dataops-mcp-provision
 ```
@@ -32,12 +28,14 @@ az deployment sub create \
 | Concern | Why not | How to handle |
 |---|---|---|
 | Client secrets | Bicep cannot safely emit secrets through deployment outputs | `write-env.sh` runs `az ad app credential reset` |
-| Admin consent | Not modeled in the Graph Bicep extension yet | `az ad app permission admin-consent --id <mcp_app_id>` |
 | Group membership | Per-user, dynamic | `az ad group member add --group <id> --member-id <oid>` |
+| Worker RBAC | Intentionally not granted — decide access later | `az role assignment create` at the scope you choose |
+
+> OBO admin consent **is** done in-template now via `Microsoft.Graph/oauth2PermissionGrants` (scope `User.Read email offline_access openid profile`).
 
 ## Re-running
 
-The Graph extension is idempotent via `uniqueName`. The RBAC role assignments use deterministic GUIDs (`guid(scope, principal, role)`), so re-deploying the same parameters is a no-op.
+The Graph extension is idempotent via `uniqueName`, so re-deploying the same parameters is a no-op.
 
 **Don't** re-run `write-env.sh` casually — it resets secrets and breaks any running worker until you redistribute the new `.env`.
 

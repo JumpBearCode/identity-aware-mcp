@@ -1,20 +1,34 @@
 """
 Provision everything needed for the identity-aware DataOps MCP stack.
 
-Creates in your Entra tenant + Azure subscription:
-  1. MCP Server App registration (with user_impersonation scope + VS Code pre-auth + client secret)
+Creates in your Entra tenant:
+  1. MCP Server App registration (with user_impersonation scope + VS Code pre-auth +
+     client secret), plus admin consent for OBO -> Graph (User.Read email
+     offline_access openid profile)
   2. Two AD security groups (mcp-diagnose-users, mcp-action-admins)
   3. Two Service Principals (diagnose-sp, action-sp) with their own client secrets
-  4. RBAC role assignments scoped to PROVISION_TARGET_SCOPE:
-       - diagnose-sp  -> Reader
-       - action-sp    -> Contributor   (override per environment as needed)
+
+No Azure RBAC is granted here — the worker SPs have NO resource access until you
+assign it yourself later.
 
 Writes the resulting IDs/secrets to ../../.env so docker-compose picks them up.
+
+On-Behalf-Of (OBO), in one breath:
+  The client (e.g. VS Code) signs the user in and gets a token for the MCP server
+  (scope api://<mcp>/user_impersonation). The server can't reuse that token to call
+  Graph — it's audienced to the server, not Graph. OBO is the exchange: the server
+  trades the incoming user token for a NEW token to a downstream API (Graph), still
+  carrying the user's identity. So Graph sees "this user", not "the server" — every
+  downstream call is evaluated against the user's own permissions, not an app's.
+  The admin consent below is what lets that exchange succeed without a per-user
+  consent prompt mid-flow.
 
 Prereqs:
   - `az login` already done with an account that has:
       * Application Administrator + Group Administrator in Entra
-      * Owner / User Access Administrator on PROVISION_TARGET_SCOPE
+      * Application Administrator (or Cloud App Admin) is enough to grant the OBO
+        admin consent here — these are low-privilege, user-consentable scopes.
+        Only high-privilege scopes would need Privileged Role Admin / Global Admin.
   - uv sync (see pyproject.toml)
 
 Run:
@@ -28,9 +42,6 @@ import sys
 import uuid
 
 from azure.identity.aio import AzureCliCredential
-from azure.identity import AzureCliCredential as SyncAzureCliCredential
-from azure.mgmt.authorization import AuthorizationManagementClient
-from azure.mgmt.authorization.models import RoleAssignmentCreateParameters
 from msgraph import GraphServiceClient
 from msgraph.generated.applications.item.add_password.add_password_post_request_body import (
     AddPasswordPostRequestBody,
@@ -38,6 +49,7 @@ from msgraph.generated.applications.item.add_password.add_password_post_request_
 from msgraph.generated.models.api_application import ApiApplication
 from msgraph.generated.models.application import Application
 from msgraph.generated.models.group import Group
+from msgraph.generated.models.o_auth2_permission_grant import OAuth2PermissionGrant
 from msgraph.generated.models.password_credential import PasswordCredential
 from msgraph.generated.models.permission_scope import PermissionScope
 from msgraph.generated.models.pre_authorized_application import PreAuthorizedApplication
@@ -48,19 +60,19 @@ from msgraph.generated.models.service_principal import ServicePrincipal
 
 # --- Configuration ----------------------------------------------------------
 TENANT_ID = os.environ["AZURE_TENANT_ID"]
-SUBSCRIPTION_ID = os.environ["AZURE_SUBSCRIPTION_ID"]
-TARGET_SCOPE = os.environ.get(
-    "PROVISION_TARGET_SCOPE",
-    f"/subscriptions/{SUBSCRIPTION_ID}",  # default: subscription-wide; tighten to RG in prod
-)
 
 VSCODE_CLIENT_ID = "aebc6443-996d-45c2-90f0-388ff96faa56"
 GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
-GRAPH_USER_READ = "e1fe6dd8-ba31-4d61-89e7-88639da4683d"
 
-# Built-in role IDs (Reader, Contributor)
-READER_ROLE_ID = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
-CONTRIBUTOR_ROLE_ID = "b24988ac-6180-42a0-ab88-20f7382dd24c"
+# Delegated Graph permission IDs (declared on the app so they show in the portal).
+GRAPH_USER_READ = "e1fe6dd8-ba31-4d61-89e7-88639da4683d"
+GRAPH_EMAIL = "64a6cdd6-aab1-4aaf-94b8-3cc8405e90d0"
+GRAPH_OFFLINE_ACCESS = "7427e0e9-2fba-42fe-b0c0-848c9e6a8182"
+GRAPH_OPENID = "37f7f235-527c-4136-accd-4a02d197296e"
+GRAPH_PROFILE = "14dad69e-099b-42c9-810b-d002981feec1"
+
+# Space-delimited scope string the MCP server is admin-consented for (OBO -> Graph).
+GRAPH_OBO_SCOPE = "User.Read email offline_access openid profile"
 
 ENV_OUT = pathlib.Path(__file__).resolve().parents[2] / ".env"
 
@@ -86,7 +98,13 @@ async def create_mcp_server_app(graph: GraphServiceClient) -> tuple[str, str, st
             required_resource_access=[
                 RequiredResourceAccess(
                     resource_app_id=GRAPH_APP_ID,
-                    resource_access=[ResourceAccess(id=GRAPH_USER_READ, type="Scope")],
+                    resource_access=[
+                        ResourceAccess(id=GRAPH_USER_READ, type="Scope"),
+                        ResourceAccess(id=GRAPH_EMAIL, type="Scope"),
+                        ResourceAccess(id=GRAPH_OFFLINE_ACCESS, type="Scope"),
+                        ResourceAccess(id=GRAPH_OPENID, type="Scope"),
+                        ResourceAccess(id=GRAPH_PROFILE, type="Scope"),
+                    ],
                 )
             ],
             api=ApiApplication(
@@ -126,6 +144,12 @@ async def create_mcp_server_app(graph: GraphServiceClient) -> tuple[str, str, st
     )
     assert sp and sp.id
     print(f"  MCP Server SP created: {sp.id}")
+
+    # Pre-consent OBO -> Graph for the whole tenant. These scopes are low-privilege
+    # and user-consentable, so each user COULD click through a consent prompt
+    # themselves — this just does it once for everyone so nobody sees a prompt
+    # mid-flow (and so OBO doesn't fail with interaction_required).
+    await grant_obo_admin_consent(graph, sp.id)
 
     # Client secret
     pw = await graph.applications.by_application_id(app.id).add_password.post(
@@ -180,21 +204,20 @@ async def create_worker_sp(
     return sp.id, app.app_id, pw.secret_text
 
 
-# --- RBAC -------------------------------------------------------------------
-def assign_rbac(sp_object_id: str, role_id: str, scope: str) -> None:
-    cred = SyncAzureCliCredential()
-    auth_client = AuthorizationManagementClient(cred, SUBSCRIPTION_ID)
-    role_def_id = f"/subscriptions/{SUBSCRIPTION_ID}/providers/Microsoft.Authorization/roleDefinitions/{role_id}"
-    auth_client.role_assignments.create(
-        scope=scope,
-        role_assignment_name=str(uuid.uuid4()),
-        parameters=RoleAssignmentCreateParameters(
-            role_definition_id=role_def_id,
-            principal_id=sp_object_id,
-            principal_type="ServicePrincipal",
-        ),
+# --- Admin consent (OBO -> Graph) -------------------------------------------
+async def grant_obo_admin_consent(graph: GraphServiceClient, server_sp_id: str) -> None:
+    """Tenant-wide delegated grant: MCP server SP -> Graph, for the OBO scopes."""
+    graph_sp = await graph.service_principals_with_app_id(GRAPH_APP_ID).get()
+    assert graph_sp and graph_sp.id
+    await graph.oauth2_permission_grants.post(
+        OAuth2PermissionGrant(
+            client_id=server_sp_id,
+            consent_type="AllPrincipals",
+            resource_id=graph_sp.id,
+            scope=GRAPH_OBO_SCOPE,
+        )
     )
-    print(f"  RBAC: {sp_object_id} -> role {role_id} on {scope}")
+    print(f"  Admin consent (OBO -> Graph): {GRAPH_OBO_SCOPE}")
 
 
 # --- Main -------------------------------------------------------------------
@@ -214,12 +237,8 @@ async def main() -> None:
     act_group = await ensure_group(graph, "mcp-action-admins", "mcp-action-admins")
 
     print("\n==> Worker SPs")
-    diag_sp_obj, diag_sp_id, diag_sp_secret = await create_worker_sp(graph, "dataops-diagnose-sp")
-    act_sp_obj, act_sp_id, act_sp_secret = await create_worker_sp(graph, "dataops-action-sp")
-
-    print("\n==> RBAC")
-    assign_rbac(diag_sp_obj, READER_ROLE_ID, TARGET_SCOPE)
-    assign_rbac(act_sp_obj, CONTRIBUTOR_ROLE_ID, TARGET_SCOPE)
+    _, diag_sp_id, diag_sp_secret = await create_worker_sp(graph, "dataops-diagnose-sp")
+    _, act_sp_id, act_sp_secret = await create_worker_sp(graph, "dataops-action-sp")
 
     write_env({
         "AZURE_TENANT_ID": TENANT_ID,
@@ -236,8 +255,7 @@ async def main() -> None:
 
     print("\nNext steps:")
     print("  1. Add your user(s) to the AD groups above (Azure portal or `az ad group member add`).")
-    print("  2. In Entra portal: MCP Server App -> API permissions -> Grant admin consent")
-    print("     (so OBO -> Graph works without per-user consent).")
+    print("  2. Grant the worker SPs whatever Azure RBAC they need — none is assigned yet.")
     print("  3. cd ../.. && docker compose up --build")
 
 
