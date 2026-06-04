@@ -51,6 +51,24 @@ On success the script writes `../../.env` (refuses to overwrite an existing one)
 with all the IDs + secrets that `docker-compose.yml` consumes, and prints the two
 group IDs you'll need in step 2.
 
+### What lands in `.env`
+
+| Key | What it is | Consumed by |
+|---|---|---|
+| `AZURE_TENANT_ID` | Your Entra tenant ID | mcp-server (JWT issuer/OBO) + both workers |
+| `MCP_APP_ID` | `DataOps MCP Server` app (client) ID — also the token audience `api://<MCP_APP_ID>` | mcp-server |
+| `MCP_CLIENT_SECRET` | Secret for the MCP server app, used for the OBO exchange to Graph | mcp-server |
+| `DIAGNOSE_GROUP_ID` | AD group `mcp-diagnose-users` object ID — gates the diagnose tool | mcp-server |
+| `ACTION_GROUP_ID` | AD group `mcp-action-admins` object ID — gates the action tool | mcp-server |
+| `DIAGNOSE_SP_CLIENT_ID` | `dataops-diagnose-sp` app (client) ID — identity diagnose-worker runs as | diagnose-worker (`AZURE_CLIENT_ID`) |
+| `DIAGNOSE_SP_CLIENT_SECRET` | Secret for the diagnose worker SP | diagnose-worker (`AZURE_CLIENT_SECRET`) |
+| `ACTION_SP_CLIENT_ID` | `dataops-action-sp` app (client) ID — identity action-worker runs as | action-worker (`AZURE_CLIENT_ID`) |
+| `ACTION_SP_CLIENT_SECRET` | Secret for the action worker SP | action-worker (`AZURE_CLIENT_SECRET`) |
+| `MCP_SERVER_BASE_URL` | Public base URL of the server (`http://localhost:8080`); advertised in the OAuth Protected Resource Metadata | mcp-server |
+
+> Three secrets live in this file in plaintext — treat `.env` as sensitive
+> (it's git-ignored) and rotate the secrets periodically.
+
 **What is OBO, and why the admin consent?**
 The client (VS Code) signs the user in and gets a token *for the MCP server*
 (`user_impersonation`). The server can't reuse that token to call Graph — it's
