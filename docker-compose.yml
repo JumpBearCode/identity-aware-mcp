@@ -1,6 +1,6 @@
 services:
   mcp-server:
-    build: ./mcp-server
+    build: ./src/mcp-server
     container_name: mcp-server
     ports:
       - "8081:8080"   # host 8080 was taken locally; container still listens on 8080
@@ -13,7 +13,7 @@ services:
       - action-worker
 
   diagnose-worker:
-    build: ./diagnose-worker
+    build: ./src/diagnose-worker
     container_name: diagnose-worker
     environment:
       AZURE_TENANT_ID: ${AZURE_TENANT_ID}
@@ -25,7 +25,7 @@ services:
       PORT: "9001"
 
   action-worker:
-    build: ./action-worker
+    build: ./src/action-worker
     container_name: action-worker
     environment:
       AZURE_TENANT_ID: ${AZURE_TENANT_ID}

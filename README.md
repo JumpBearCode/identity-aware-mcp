@@ -1,6 +1,6 @@
 # Identity-aware Azure DataOps MCP (local Docker)
 
-A minimal reference implementation of the architecture described in `../mcp_discussion.md`.
+A minimal reference implementation of the architecture described in `docs/mcp_discussion.md`.
 
 Three containers:
 
