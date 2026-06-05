@@ -3,7 +3,7 @@ services:
     build: ./mcp-server
     container_name: mcp-server
     ports:
-      - "8080:8080"
+      - "8081:8080"   # host 8080 was taken locally; container still listens on 8080
     env_file: .env
     environment:
       DIAGNOSE_WORKER_URL: http://diagnose-worker:9001
@@ -19,6 +19,9 @@ services:
       AZURE_TENANT_ID: ${AZURE_TENANT_ID}
       AZURE_CLIENT_ID: ${DIAGNOSE_SP_CLIENT_ID}
       AZURE_CLIENT_SECRET: ${DIAGNOSE_SP_CLIENT_SECRET}
+      # Worker holds only data-plane RBAC; default all `az storage` calls to AAD
+      # so commands work without needing --auth-mode login each time.
+      AZURE_STORAGE_AUTH_MODE: login
       PORT: "9001"
 
   action-worker:
@@ -28,4 +31,7 @@ services:
       AZURE_TENANT_ID: ${AZURE_TENANT_ID}
       AZURE_CLIENT_ID: ${ACTION_SP_CLIENT_ID}
       AZURE_CLIENT_SECRET: ${ACTION_SP_CLIENT_SECRET}
+      # Worker holds only data-plane RBAC; default all `az storage` calls to AAD
+      # so commands work without needing --auth-mode login each time.
+      AZURE_STORAGE_AUTH_MODE: login
       PORT: "9002"
