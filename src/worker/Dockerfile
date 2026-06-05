@@ -8,5 +8,6 @@ WORKDIR /app
 COPY worker.py entrypoint.sh ./
 RUN chmod +x entrypoint.sh
 
-EXPOSE 9002
+# Port and identity are set per-service via env (PORT / WORKER_NAME / AZURE_*);
+# see entrypoint.sh and docker-compose.yml.
 ENTRYPOINT ["./entrypoint.sh"]

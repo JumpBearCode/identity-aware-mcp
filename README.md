@@ -10,6 +10,8 @@ Three containers:
 | `diagnose-worker` | `diagnose-sp` Service Principal | Read-only RBAC (Reader) |
 | `action-worker` | `action-sp` Service Principal | Scoped write RBAC |
 
+Both workers run the same `bash-worker` image; they differ only by the injected Service Principal — identity is the boundary, not code.
+
 ```
 VS Code / Claude Code
    │  Entra OAuth (PKCE)

@@ -14,9 +14,11 @@ services:
       - action-worker
 
   diagnose-worker:
-    build: ./src/diagnose-worker
+    build: ./src/worker
+    image: bash-worker:latest
     container_name: diagnose-worker
     environment:
+      WORKER_NAME: diagnose-worker
       AZURE_TENANT_ID: ${AZURE_TENANT_ID}
       AZURE_CLIENT_ID: ${DIAGNOSE_SP_CLIENT_ID}
       AZURE_CLIENT_SECRET: ${DIAGNOSE_SP_CLIENT_SECRET}
@@ -27,9 +29,11 @@ services:
       PORT: "9001"
 
   action-worker:
-    build: ./src/action-worker
+    build: ./src/worker
+    image: bash-worker:latest
     container_name: action-worker
     environment:
+      WORKER_NAME: action-worker
       AZURE_TENANT_ID: ${AZURE_TENANT_ID}
       AZURE_CLIENT_ID: ${ACTION_SP_CLIENT_ID}
       AZURE_CLIENT_SECRET: ${ACTION_SP_CLIENT_SECRET}

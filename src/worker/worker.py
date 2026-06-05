@@ -1,4 +1,18 @@
-"""diagnose-worker: read-only bash executor. RBAC of the diagnose-sp is the safety boundary."""
+"""worker: scoped bash executor shared by the diagnose and action workers.
+
+Both workers run this exact same program. The ONLY thing that differentiates them
+is identity and Azure RBAC — injected via env (the Service Principal credentials)
+and configured on the Azure side, not in code. That is the whole point: the
+execution substrate is generic; the boundary is the worker's SP + RBAC.
+
+  - diagnose-worker -> read-only SP    (Reader-style RBAC)
+  - action-worker   -> write-scoped SP (Contributor-style RBAC)
+
+There is intentionally NO human-approval gate here. Human-in-the-loop approval is
+the MCP *client's* responsibility (interactive clients prompt before a tool call
+by default); the MCP server signals risk via tool annotations. The real,
+non-bypassable safety boundary is this worker's SP RBAC plus audit logging.
+"""
 
 import asyncio
 import logging
@@ -7,12 +21,13 @@ import os
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+WORKER_NAME = os.environ.get("WORKER_NAME", "worker")
+MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", str(64 * 1024)))
+
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
-logger = logging.getLogger("diagnose-worker")
+logger = logging.getLogger(WORKER_NAME)
 
 app = FastAPI()
-PORT = int(os.environ.get("PORT", "9001"))
-MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", str(64 * 1024)))
 
 TRUNCATE_HINT = (
     "\n\n[output truncated at {n} bytes] Narrow it at the source — "
