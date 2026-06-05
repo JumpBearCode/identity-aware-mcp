@@ -16,7 +16,7 @@ VS Code / Claude Code
    ▼
 http://localhost:8080  ── mcp-server (JWT validate + OBO group lookup + route)
                               ├──► diagnose-worker  (read-only az cli)
-                              └──► action-worker    (write az cli, gated by hook)
+                              └──► action-worker    (write az cli, bounded by SP RBAC; HITL by client)
 ```
 
 ## Quickstart

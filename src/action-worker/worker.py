@@ -1,20 +1,22 @@
-"""action-worker: gated bash executor. Each call is held for human approval
-via a file-based hook (the simplest possible substitute for a real UI hook).
+"""action-worker: scoped bash executor.
 
-Approval mechanism:
-  - Pending request written to /tmp/pending/<id>.json
-  - Operator approves by `touch /tmp/pending/<id>.approve` (or .reject)
-  - For local dev, simply tail the container logs and use `docker exec`.
+Runs write-capable `az cli` / shell commands under the action Service Principal.
+There is intentionally NO approval gate here:
 
-A production version would push to Slack / Teams / pager and resolve via webhook.
+  - Human-in-the-loop approval is the MCP *client's* responsibility. Every
+    interactive client (VS Code, Claude Code, Cursor, Gemini CLI, ...) prompts
+    before a tool call by default. The server cannot portably render or enforce a
+    per-client approval UI, so it doesn't try — there is no standard, cross-client
+    way to declare "this tool needs approval" anyway.
+  - The MCP server signals risk to clients via tool annotations
+    (destructiveHint on action_bash); see src/mcp-server/main.py.
+  - The real, non-bypassable safety boundary is this worker's Service Principal
+    RBAC scope plus audit logging — not a click.
 """
 
 import asyncio
-import json
 import logging
 import os
-import pathlib
-import uuid
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -24,51 +26,15 @@ logger = logging.getLogger("action-worker")
 
 app = FastAPI()
 PORT = int(os.environ.get("PORT", "9002"))
-PENDING_DIR = pathlib.Path("/tmp/pending")
-PENDING_DIR.mkdir(parents=True, exist_ok=True)
-APPROVAL_TIMEOUT_SEC = int(os.environ.get("APPROVAL_TIMEOUT_SEC", "300"))
 
 
 class ExecRequest(BaseModel):
     command: str
 
 
-async def _await_approval(req_id: str) -> str:
-    approve = PENDING_DIR / f"{req_id}.approve"
-    reject = PENDING_DIR / f"{req_id}.reject"
-    for _ in range(APPROVAL_TIMEOUT_SEC):
-        if approve.exists():
-            return "approved"
-        if reject.exists():
-            return "rejected"
-        await asyncio.sleep(1)
-    return "timeout"
-
-
 @app.post("/exec")
 async def exec_command(req: ExecRequest):
-    req_id = uuid.uuid4().hex[:8]
-    payload = {"id": req_id, "command": req.command}
-    (PENDING_DIR / f"{req_id}.json").write_text(json.dumps(payload, indent=2))
-
-    logger.warning(
-        "APPROVAL NEEDED  id=%s  command=%s\n"
-        "  Approve: docker exec action-worker touch /tmp/pending/%s.approve\n"
-        "  Reject:  docker exec action-worker touch /tmp/pending/%s.reject",
-        req_id,
-        req.command,
-        req_id,
-        req_id,
-    )
-
-    verdict = await _await_approval(req_id)
-    if verdict != "approved":
-        return {
-            "exit_code": None,
-            "stdout": "",
-            "stderr": f"Action {verdict} by approval hook.",
-        }
-
+    logger.info("exec: %s", req.command)
     proc = await asyncio.create_subprocess_shell(
         req.command,
         stdout=asyncio.subprocess.PIPE,

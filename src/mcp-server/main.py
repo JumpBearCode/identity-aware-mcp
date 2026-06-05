@@ -104,28 +104,50 @@ async def _exec_on_worker(worker_url: str, command: str) -> dict:
         return r.json()
 
 
-@mcp.tool(auth=require_diagnose)
+@mcp.tool(
+    auth=require_diagnose,
+    annotations={"readOnlyHint": True, "openWorldHint": True},
+)
 async def diagnose_bash(command: str) -> dict:
-    """Run a read-only diagnostic command on the diagnose-worker.
+    """Run a read-only shell command for Azure diagnostics.
 
-    Routed to a Service Principal with read-only RBAC. No human approval required;
-    the SP's RBAC is the safety boundary.
+    The diagnose-worker is a bash shell with the Azure CLI (`az`). Standard shell
+    glue — pipes, loops, `jq`, etc. — is available to combine `az` calls. Use it
+    for READ-only investigation, e.g.:
+        az datafactory pipeline-run show --factory-name F --run-id R -o json
+        for rg in $(az group list --query "[].name" -o tsv); do az ...; done
+
+    Keep work to Azure; running unrelated shell just burns tokens.
+    Returns {exit_code, stdout, stderr}.
     """
     logger.info("diagnose_bash: %s", command)
     return await _exec_on_worker(DIAGNOSE_WORKER_URL, command)
 
 
-@mcp.tool(auth=require_action)
+@mcp.tool(
+    auth=require_action,
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    },
+)
 async def action_bash(command: str, ctx: Context) -> dict:
-    """Run a write command on the action-worker (gated by approval hook).
+    """Run a write/modify shell command for Azure operations.
 
-    The action-worker enforces a per-tool-call approval hook before executing.
+    The action-worker is a bash shell with the Azure CLI (`az`). Standard shell
+    glue — pipes, loops, `jq`, etc. — is available to combine `az` calls. Use it
+    for commands that CHANGE state, e.g.:
+        az datafactory pipeline create-run --factory-name F --name P
+        az datafactory trigger start --factory-name F --name T
+        az vm restart --ids "$(az vm list -g G --query "[].id" -o tsv)"
+
+    Keep work to Azure. Returns {exit_code, stdout, stderr}.
     """
     user_oid = await ctx.get_state("user_oid")
     logger.info("action_bash: user=%s command=%s", user_oid, command)
-    return await _exec_on_worker(
-        ACTION_WORKER_URL, command  # worker prompts for approval internally
-    )
+    return await _exec_on_worker(ACTION_WORKER_URL, command)
 
 
 @mcp.custom_route("/health", methods=["GET"])
