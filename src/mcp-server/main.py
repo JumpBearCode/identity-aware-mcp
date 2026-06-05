@@ -30,6 +30,7 @@ ACTION_GROUP_ID = os.environ["ACTION_GROUP_ID"]
 BASE_URL = os.environ.get("MCP_SERVER_BASE_URL", "http://localhost:8080")
 DIAGNOSE_WORKER_URL = os.environ.get("DIAGNOSE_WORKER_URL", "http://diagnose-worker:9001")
 ACTION_WORKER_URL = os.environ.get("ACTION_WORKER_URL", "http://action-worker:9002")
+MCP_EXEC_TIMEOUT = float(os.environ.get("MCP_EXEC_TIMEOUT", "120"))
 
 # --- JWT verification: validate Entra access tokens against Entra JWKS ---
 verifier = AzureJWTVerifier(
@@ -98,8 +99,13 @@ mcp = FastMCP("Azure DataOps", auth=auth, middleware=[UserAuthMiddleware()])
 
 
 async def _exec_on_worker(worker_url: str, command: str) -> dict:
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        r = await client.post(f"{worker_url}/exec", json={"command": command})
+    # httpx waits MCP_EXEC_TIMEOUT; the worker kills the subprocess 10s earlier so
+    # a timeout comes back as a structured result instead of an httpx ReadTimeout.
+    async with httpx.AsyncClient(timeout=MCP_EXEC_TIMEOUT) as client:
+        r = await client.post(
+            f"{worker_url}/exec",
+            json={"command": command, "timeout": MCP_EXEC_TIMEOUT - 10},
+        )
         r.raise_for_status()
         return r.json()
 
@@ -133,7 +139,7 @@ async def diagnose_bash(command: str) -> dict:
         "openWorldHint": True,
     },
 )
-async def action_bash(command: str, ctx: Context) -> dict:
+async def action_bash(command: str, explanation: str, ctx: Context) -> dict:
     """Run a write/modify shell command for Azure operations.
 
     The action-worker is a bash shell with the Azure CLI (`az`). Standard shell
@@ -143,10 +149,22 @@ async def action_bash(command: str, ctx: Context) -> dict:
         az datafactory trigger start --factory-name F --name T
         az vm restart --ids "$(az vm list -g G --query "[].id" -o tsv)"
 
-    Keep work to Azure. Returns {exit_code, stdout, stderr}.
+    Keep work to Azure.
+
+    `explanation` is REQUIRED: one short, plain-language sentence (for the human
+    who approves this) stating what the command does and its blast radius — e.g.
+    "Reruns the daily_customer_load ADF pipeline; may duplicate rows already
+    loaded downstream."
+
+    Returns {exit_code, stdout, stderr}.
     """
     user_oid = await ctx.get_state("user_oid")
-    logger.info("action_bash: user=%s command=%s", user_oid, command)
+    logger.info(
+        "action_bash: user=%s explanation=%s command=%s",
+        user_oid,
+        explanation,
+        command,
+    )
     return await _exec_on_worker(ACTION_WORKER_URL, command)
 
 

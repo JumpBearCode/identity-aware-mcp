@@ -8,6 +8,7 @@ services:
     environment:
       DIAGNOSE_WORKER_URL: http://diagnose-worker:9001
       ACTION_WORKER_URL: http://action-worker:9002
+      MCP_EXEC_TIMEOUT: ${MCP_EXEC_TIMEOUT:-120}
     depends_on:
       - diagnose-worker
       - action-worker
@@ -22,6 +23,7 @@ services:
       # Worker holds only data-plane RBAC; default all `az storage` calls to AAD
       # so commands work without needing --auth-mode login each time.
       AZURE_STORAGE_AUTH_MODE: login
+      MAX_OUTPUT_BYTES: ${MAX_OUTPUT_BYTES:-65536}
       PORT: "9001"
 
   action-worker:
@@ -34,4 +36,5 @@ services:
       # Worker holds only data-plane RBAC; default all `az storage` calls to AAD
       # so commands work without needing --auth-mode login each time.
       AZURE_STORAGE_AUTH_MODE: login
+      MAX_OUTPUT_BYTES: ${MAX_OUTPUT_BYTES:-65536}
       PORT: "9002"
