@@ -11,6 +11,7 @@ import logging
 import os
 
 import httpx
+from cache import GroupCache, InMemoryBackend
 from fastmcp import Context, FastMCP
 from fastmcp.server.auth import AuthContext, RemoteAuthProvider
 from fastmcp.server.auth.providers.azure import AzureJWTVerifier
@@ -53,16 +54,30 @@ msal_app = ConfidentialClientApplication(
 )
 
 
-async def _user_in_groups(user_jwt: str, group_ids: list[str]) -> set[str]:
-    """OBO-exchange the user's MCP token for a Graph token, then ask Graph which
-    of `group_ids` the user is a (transitive) member of. Returns that subset.
+# --- Group-membership cache ---------------------------------------------------
+# Cache "which of OUR groups this user belongs to", keyed by oid, to collapse the
+# repeated Graph calls (tools/list runs the auth check once per tool; tools/call
+# runs it again). Backed by an in-memory store today; swap InMemoryBackend for a
+# RedisBackend to share across pods. See cache.py and docs/MCP-鉴权-缓存与凭据演进.md.
+GROUP_CACHE_TTL = 300  # seconds; also the max window a revoked user stays allowed
+KNOWN_GROUPS = [DIAGNOSE_GROUP_ID, ACTION_GROUP_ID]
 
-    Uses POST /me/checkMemberGroups instead of listing every group the user
-    belongs to: fixed-size payload, no pagination, evaluates membership server-side
-    (transitive). Accepts up to 20 group IDs per call.
+group_cache = GroupCache(InMemoryBackend(ttl=GROUP_CACHE_TTL))
+
+
+async def _user_groups(ctx: AuthContext) -> set[str]:
+    """Subset of KNOWN_GROUPS the current user belongs to, cached by oid.
+
+    On a cache miss, one OBO exchange + Graph POST /me/checkMemberGroups resolves
+    all known groups at once (fixed-size payload, no pagination, transitive),
+    then caches the result.
     """
+    oid = ctx.token.claims.get("oid") if hasattr(ctx.token, "claims") else None
+    if oid is not None and (cached := await group_cache.get(oid)) is not None:
+        return cached
+
     obo = msal_app.acquire_token_on_behalf_of(
-        user_assertion=user_jwt,
+        user_assertion=ctx.token.token,
         scopes=["https://graph.microsoft.com/.default"],
     )
     if "access_token" not in obo:
@@ -72,17 +87,21 @@ async def _user_in_groups(user_jwt: str, group_ids: list[str]) -> set[str]:
         r = await client.post(
             "https://graph.microsoft.com/v1.0/me/checkMemberGroups",
             headers={"Authorization": f"Bearer {obo['access_token']}"},
-            json={"groupIds": group_ids},
+            json={"groupIds": KNOWN_GROUPS},
         )
         r.raise_for_status()
-        return set(r.json().get("value", []))
+        groups = set(r.json().get("value", []))
+
+    if oid is not None:
+        await group_cache.set(oid, groups)
+    return groups
 
 
 def _require_group(group_id: str):
     async def check(ctx: AuthContext) -> bool:
         if ctx.token is None:
             return False
-        return group_id in await _user_in_groups(ctx.token.token, [group_id])
+        return group_id in await _user_groups(ctx)
 
     return check
 
