@@ -53,8 +53,14 @@ msal_app = ConfidentialClientApplication(
 )
 
 
-async def _user_groups_via_obo(user_jwt: str) -> set[str]:
-    """OBO-exchange the user's MCP token for a Graph token, then list group IDs."""
+async def _user_in_groups(user_jwt: str, group_ids: list[str]) -> set[str]:
+    """OBO-exchange the user's MCP token for a Graph token, then ask Graph which
+    of `group_ids` the user is a (transitive) member of. Returns that subset.
+
+    Uses POST /me/checkMemberGroups instead of listing every group the user
+    belongs to: fixed-size payload, no pagination, evaluates membership server-side
+    (transitive). Accepts up to 20 group IDs per call.
+    """
     obo = msal_app.acquire_token_on_behalf_of(
         user_assertion=user_jwt,
         scopes=["https://graph.microsoft.com/.default"],
@@ -63,19 +69,20 @@ async def _user_groups_via_obo(user_jwt: str) -> set[str]:
         logger.error("OBO failed: %s", obo.get("error_description"))
         return set()
     async with httpx.AsyncClient() as client:
-        r = await client.get(
-            "https://graph.microsoft.com/v1.0/me/transitiveMemberOf/microsoft.graph.group?$select=id",
+        r = await client.post(
+            "https://graph.microsoft.com/v1.0/me/checkMemberGroups",
             headers={"Authorization": f"Bearer {obo['access_token']}"},
+            json={"groupIds": group_ids},
         )
         r.raise_for_status()
-        return {g["id"] for g in r.json().get("value", [])}
+        return set(r.json().get("value", []))
 
 
 def _require_group(group_id: str):
     async def check(ctx: AuthContext) -> bool:
         if ctx.token is None:
             return False
-        return group_id in await _user_groups_via_obo(ctx.token.token)
+        return group_id in await _user_in_groups(ctx.token.token, [group_id])
 
     return check
 
