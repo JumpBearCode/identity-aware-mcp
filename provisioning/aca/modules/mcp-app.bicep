@@ -19,6 +19,9 @@ param location string
 @description('Container Apps environment id.')
 param environmentId string
 
+@description('Container Apps environment default domain (for the public FQDN).')
+param environmentDefaultDomain string
+
 @description('MCP server container image. Placeholder until the real image is pushed to ACR.')
 param mcpImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
@@ -53,6 +56,9 @@ param blobContainerResourceId string
 param sandboxImage string = ''
 
 var redisUrl = 'redis://${redisHost}:${redisPort}'
+// Deterministic public FQDN (matches ingress.fqdn) so the OAuth Protected
+// Resource Metadata advertises the real https URL, not localhost.
+var publicBaseUrl = 'https://${name}-mcp.${environmentDefaultDomain}'
 
 resource app 'Microsoft.App/containerApps@2024-03-01' = {
   name: '${name}-mcp'
@@ -89,6 +95,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
           }
           env: [
             { name: 'EXECUTOR', value: 'aca' }
+            { name: 'MCP_SERVER_BASE_URL', value: publicBaseUrl }
             { name: 'AZURE_TENANT_ID', value: tenantId }
             { name: 'MCP_APP_ID', value: mcpAppId }
             { name: 'MCP_CLIENT_SECRET', secretRef: 'mcp-client-secret' }

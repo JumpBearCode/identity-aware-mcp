@@ -107,6 +107,7 @@ module mcpApp 'modules/mcp-app.bicep' = {
     name: name
     location: location
     environmentId: environment.outputs.environmentId
+    environmentDefaultDomain: environment.outputs.environmentDefaultDomain
     mcpImage: mcpImage
     mcpClientSecret: mcpClientSecret
     tenantId: tenant().tenantId
