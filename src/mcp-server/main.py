@@ -11,8 +11,15 @@ import logging
 import os
 
 import httpx
-from cache import GroupCache, InMemoryBackend
+from cache import (
+    GroupCache,
+    InMemoryBackend,
+    RedisBackend,
+    UserSessionCache,
+    make_redis_client,
+)
 from executor import SessionCtx, make_executor
+from session import SessionResolver
 from fastmcp import Context, FastMCP
 from fastmcp.server.auth import AuthContext, RemoteAuthProvider
 from fastmcp.server.auth.providers.azure import AzureJWTVerifier
@@ -34,6 +41,17 @@ BASE_URL = os.environ.get("MCP_SERVER_BASE_URL", "http://localhost:8080")
 # Execution backend: local docker workers (default) or ACA sandboxes. Both sit
 # behind the same Executor interface; see executor.py / sandbox_manager.py.
 executor = make_executor()
+
+# Session derivation: a Redis-backed 30-min sliding window per user (see
+# session.py). Falls back to transport ids if no Redis is configured.
+SESSION_TTL = int(os.environ.get("MCP_SESSION_TTL", "1800"))
+REDIS_URL = os.environ.get("REDIS_URL")
+_redis = make_redis_client(REDIS_URL) if REDIS_URL else None
+session_resolver = (
+    SessionResolver(UserSessionCache(RedisBackend(_redis, ttl=SESSION_TTL)))
+    if _redis is not None
+    else None
+)
 
 # --- JWT verification: validate Entra access tokens against Entra JWKS ---
 verifier = AzureJWTVerifier(
@@ -129,7 +147,7 @@ class UserAuthMiddleware(Middleware):
         oid = token.claims.get("oid") if token and hasattr(token, "claims") else None
         fctx = context.fastmcp_context
         if fctx is not None:
-            session_id, conversation_id = _derive_ids(oid, fctx)
+            session_id, conversation_id = await _derive_ids(oid, fctx)
             await fctx.set_state("user_oid", oid)
             await fctx.set_state("session_id", session_id)
             await fctx.set_state("conversation_id", conversation_id)
@@ -137,11 +155,13 @@ class UserAuthMiddleware(Middleware):
         return await call_next(context)
 
 
-def _derive_ids(oid, fctx) -> tuple[str | None, str | None]:
-    """Best-effort Session/Conversation ids off the transport (Phase 4 refines)."""
-    session_id = getattr(fctx, "session_id", None) or oid
-    conversation_id = getattr(fctx, "request_id", None)
-    return session_id, conversation_id
+async def _derive_ids(oid, fctx) -> tuple[str | None, str | None]:
+    """Session/Conversation ids — Redis sliding window when available."""
+    transport_sid = getattr(fctx, "session_id", None)
+    request_id = getattr(fctx, "request_id", None)
+    if session_resolver is not None:
+        return await session_resolver.resolve(oid, transport_sid, request_id)
+    return (transport_sid or oid), request_id
 
 
 mcp = FastMCP("Azure DataOps", auth=auth, middleware=[UserAuthMiddleware()])
