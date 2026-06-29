@@ -1,16 +1,22 @@
 {
-  // Identity-aware DataOps MCP server (local Docker stack).
+  // Identity-aware DataOps MCP server.
   // VS Code + GitHub Copilot discover Entra auth automatically:
   //   1. GET /mcp -> 401 with WWW-Authenticate -> resource metadata
   //   2. metadata -> Entra tenant + scope api://<MCP_APP_ID>/user_impersonation
   //   3. VS Code's built-in client (aebc6443-...) is pre-authorized, so PKCE
   //      sign-in needs no consent screen.
-  // Host port is 8081 (8080 was taken locally). Sign in as a user who is a
-  // member of mcp-diagnose-users / mcp-action-admins to see the tools.
+  // Sign in as a user who is a member of mcp-diagnose-users / mcp-action-admins
+  // to see the diagnose_bash / action_bash tools.
   "servers": {
-    "azure-dataops": {
+    // Local Docker stack (EXECUTOR=local). Host port 8081 (8080 was taken).
+    "azure-dataops-local": {
       "type": "http",
       "url": "http://localhost:8081/mcp"
+    },
+    // Cloud ACA stack (EXECUTOR=aca) — per-Session sandboxes, passwordless FIC.
+    "azure-dataops-aca": {
+      "type": "http",
+      "url": "https://dataops-aca-mcp.icyrock-96f978c0.westus2.azurecontainerapps.io/mcp"
     }
   }
 }
