@@ -72,7 +72,9 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
       secrets: [
         {
           name: 'mcp-client-secret'
-          value: mcpClientSecret
+          // Container Apps rejects empty secret values; seed a placeholder and
+          // overwrite it post-deploy via `az containerapp secret set`.
+          value: empty(mcpClientSecret) ? 'placeholder-set-via-secret-set' : mcpClientSecret
         }
       ]
     }

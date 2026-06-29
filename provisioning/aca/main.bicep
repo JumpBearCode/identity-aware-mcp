@@ -148,6 +148,11 @@ module rbac 'modules/rbac.bicep' = {
 module fic 'modules/fic.bicep' = {
   name: 'fic'
   scope: rg
+  // Explicit: FIC references the worker SP apps by uniqueName (existing), which
+  // must already be created by the identity module before fic preflights.
+  dependsOn: [
+    identity
+  ]
   params: {
     name: name
     tenantId: tenant().tenantId
