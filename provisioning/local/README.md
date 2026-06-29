@@ -1,6 +1,13 @@
-# Bicep provisioning
+# Local provisioning (Bicep)
 
-Same end-state as the Python SDK route, declarative.
+Identity-only provisioning for the **local docker** path (`EXECUTOR=local`):
+the MCP server app (delegated `user_impersonation` + OBO admin consent), the two
+AD groups, and the `diagnose-sp` / `action-sp` worker app registrations. The two
+worker containers log in with these SPs + a client secret.
+
+For the cloud (ACA sandboxes) path, see [`../aca/`](../aca/) instead — it provisions
+the full Azure footprint (sandbox groups, storage, redis, the MCP Container App)
+and uses passwordless Federated Identity Credentials, no worker secrets.
 
 ## Prereqs
 
