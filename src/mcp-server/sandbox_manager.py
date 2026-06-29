@@ -23,7 +23,7 @@ import logging
 import os
 import shlex
 
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
 
 from blob import WorkspaceLayout
 from cache import (
@@ -290,16 +290,23 @@ class SandboxManager:
                 SandboxGroupIdentitySelector,
             )
 
-            await gclient.create_volume(
-                "workspaces",
-                type="AzureBlobByo",
-                storage_container_resource_id=self._blob_container_resource_id,
-                auth=AzureBlobByoManagedIdentityAuth(
-                    identity=SandboxGroupIdentitySelector(kind="SystemAssigned")
-                ),
-            )
+            try:
+                await gclient.create_volume(
+                    "workspaces",
+                    type="AzureBlobByo",
+                    storage_container_resource_id=self._blob_container_resource_id,
+                    auth=AzureBlobByoManagedIdentityAuth(
+                        identity=SandboxGroupIdentitySelector(kind="SystemAssigned")
+                    ),
+                )
+                logger.info("created workspace volume on %s", group_name)
+            except (ResourceExistsError, HttpResponseError) as e:
+                # create_volume is not idempotent: 409 GlobalVolumeAlreadyExists
+                # is fine (the volume already exists from a prior run/replica).
+                if getattr(e, "status_code", None) != 409:
+                    raise
+                logger.info("workspace volume already exists on %s", group_name)
             self._ensured_volumes.add(group_name)
-            logger.info("ensured workspace volume on %s", group_name)
 
     async def _resolve_disk(self, gclient, group: Group) -> dict:
         """Pick the sandbox source: prebuilt disk id > built-from-image > public."""
