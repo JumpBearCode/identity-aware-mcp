@@ -21,9 +21,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 
 from azure.core.exceptions import ResourceNotFoundError
 
+from blob import WorkspaceLayout
 from cache import (
     SessionSandboxCache,
     UserProfileCache,
@@ -80,6 +82,8 @@ class SandboxManager:
         memory: str,
         auto_suspend_seconds: int,
         auto_delete_seconds: int,
+        blob_container_resource_id: str | None = None,
+        blob_mountpoint: str = "/workspace",
         redis_client=None,
     ):
         self._cred = credential
@@ -99,11 +103,18 @@ class SandboxManager:
         self._memory = memory
         self._auto_suspend_seconds = auto_suspend_seconds
         self._auto_delete_seconds = auto_delete_seconds
+        self._blob_container_resource_id = blob_container_resource_id or None
+        self._blob_mountpoint = blob_mountpoint.rstrip("/") or "/workspace"
         self._redis = redis_client
 
         self._group_clients: dict[Group, object] = {}
         self._built_disk_ids: dict[str, str] = {}
+        self._ensured_volumes: set[str] = set()
         self._locks: dict[str, asyncio.Lock] = {}
+
+    @property
+    def _blob_enabled(self) -> bool:
+        return self._blob_container_resource_id is not None
 
     # ------------------------------------------------------------------ build
     @classmethod
@@ -140,6 +151,8 @@ class SandboxManager:
             memory=os.environ.get("SANDBOX_MEMORY", "2048Mi"),
             auto_suspend_seconds=int(os.environ.get("SANDBOX_AUTO_SUSPEND_SECONDS", "300")),
             auto_delete_seconds=int(os.environ.get("SANDBOX_AUTO_DELETE_SECONDS", "3600")),
+            blob_container_resource_id=os.environ.get("BLOB_CONTAINER_RESOURCE_ID") or None,
+            blob_mountpoint=os.environ.get("BLOB_MOUNTPOINT", "/workspace"),
             redis_client=redis_client,
         )
 
@@ -205,6 +218,7 @@ class SandboxManager:
             "AZURE_TENANT_ID": self._tenant_id,
             "AZURE_SUBSCRIPTION_ID": await self._user_subscription(ctx.user_oid),
         }
+        volumes = await self._workspace_volumes(gclient, group)
         logger.info("session miss: creating %s sandbox (%s)", group, disk_kwargs)
         poller = await gclient.begin_create_sandbox(
             labels=labels,
@@ -212,11 +226,45 @@ class SandboxManager:
             cpu=self._cpu,
             memory=self._memory,
             auto_suspend_seconds=self._auto_suspend_seconds,
+            volumes=volumes,
             **disk_kwargs,
         )
         client = await poller.result()
         await self._apply_idle_autodelete(client)
         return client
+
+    async def _workspace_volumes(self, gclient, group: Group):
+        """Mount the workspace blob container (BYO, group-MI auth) at the mountpoint."""
+        if not self._blob_enabled:
+            return None
+        from azure.containerapps.sandbox import SandboxVolume
+
+        await self._ensure_volume(gclient, group)
+        return [SandboxVolume(volume_name="workspaces", mountpoint=self._blob_mountpoint)]
+
+    async def _ensure_volume(self, gclient, group: Group) -> None:
+        """Idempotently create the group's BYO Azure Blob volume (once per group)."""
+        group_name = self._group_names[group]
+        if group_name in self._ensured_volumes:
+            return
+        async with self._lock(f"volume:{group_name}"):
+            if group_name in self._ensured_volumes:
+                return
+            from azure.containerapps.sandbox import (
+                AzureBlobByoManagedIdentityAuth,
+                SandboxGroupIdentitySelector,
+            )
+
+            await gclient.create_volume(
+                "workspaces",
+                type="AzureBlobByo",
+                storage_container_resource_id=self._blob_container_resource_id,
+                auth=AzureBlobByoManagedIdentityAuth(
+                    identity=SandboxGroupIdentitySelector(kind="SystemAssigned")
+                ),
+            )
+            self._ensured_volumes.add(group_name)
+            logger.info("ensured workspace volume on %s", group_name)
 
     async def _resolve_disk(self, gclient, group: Group) -> dict:
         """Pick the sandbox source: prebuilt disk id > built-from-image > public."""
@@ -274,9 +322,24 @@ class SandboxManager:
         return self._default_subscription
 
     # ----------------------------------------------------------------- exec
+    def _scope_to_workspace(self, ctx: SessionCtx, command: str) -> str:
+        """Run inside the per-Conversation workspace dir so writes persist to Blob.
+
+        Each exec is a fresh shell, so we (re)create and cd into the dir every
+        call; `&&` keeps the user command's own exit code as the result.
+        """
+        if not self._blob_enabled:
+            return command
+        rel = WorkspaceLayout.conversation_prefix(
+            ctx.user_oid, ctx.session_id, ctx.conversation_id
+        )
+        wd = f"{self._blob_mountpoint}/{rel}"
+        q = shlex.quote(wd)
+        return f"mkdir -p {q} && cd {q} && {{ {command}\n}}"
+
     async def exec(self, ctx: SessionCtx, command: str) -> ExecResult:
         client = await self.get_or_create(ctx)
-        result = await client.exec(command)
+        result = await client.exec(self._scope_to_workspace(ctx, command))
         stdout, t1 = _cap(result.stdout or "")
         stderr, t2 = _cap(result.stderr or "")
         if t1 or t2:

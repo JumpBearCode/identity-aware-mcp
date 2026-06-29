@@ -26,6 +26,12 @@ param registryName string
 @description('MCP app managed identity principalId.')
 param mcpPrincipalId string
 
+@description('Diagnose sandbox-group MI principalId (for BYO blob volume auth).')
+param diagnoseMiPrincipalId string
+
+@description('Action sandbox-group MI principalId (for BYO blob volume auth).')
+param actionMiPrincipalId string
+
 // Built-in role definition ids.
 var sandboxGroupDataOwnerRoleId = 'c24cf47c-5077-412d-a19c-45202126392c'
 var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
@@ -82,6 +88,49 @@ resource acrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: acr
   properties: {
     principalId: mcpPrincipalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// Sandbox-group MIs read/write the BYO blob volume on the workspace account.
+resource blobDiagnoseMi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, diagnoseMiPrincipalId, storageBlobDataContributorRoleId)
+  scope: storage
+  properties: {
+    principalId: diagnoseMiPrincipalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource blobActionMi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storage.id, actionMiPrincipalId, storageBlobDataContributorRoleId)
+  scope: storage
+  properties: {
+    principalId: actionMiPrincipalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', storageBlobDataContributorRoleId)
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// AcrPull for the sandbox-group MIs so the data plane can build disk images
+// from an ACR container ref using the group identity.
+resource acrPullDiagnoseMi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(acr.id, diagnoseMiPrincipalId, acrPullRoleId)
+  scope: acr
+  properties: {
+    principalId: diagnoseMiPrincipalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource acrPullActionMi 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(acr.id, actionMiPrincipalId, acrPullRoleId)
+  scope: acr
+  properties: {
+    principalId: actionMiPrincipalId
     roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', acrPullRoleId)
     principalType: 'ServicePrincipal'
   }

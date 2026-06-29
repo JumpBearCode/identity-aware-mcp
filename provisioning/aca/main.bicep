@@ -139,6 +139,8 @@ module rbac 'modules/rbac.bicep' = {
     storageAccountName: storage.outputs.storageAccountName
     registryName: registry.outputs.registryName
     mcpPrincipalId: mcpApp.outputs.mcpPrincipalId
+    diagnoseMiPrincipalId: sandboxGroups.outputs.diagnoseMiPrincipalId
+    actionMiPrincipalId: sandboxGroups.outputs.actionMiPrincipalId
   }
 }
 
