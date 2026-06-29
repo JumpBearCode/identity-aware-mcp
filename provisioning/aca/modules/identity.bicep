@@ -43,6 +43,9 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
   uniqueName: '${name}-mcp-server'
   displayName: 'DataOps MCP Server (ACA)'
   signInAudience: 'AzureADMyOrg'
+  // Static URI only — Bicep can't reference this app's own generated appId at
+  // create time. FastMCP advertises the scope as api://<appId>/user_impersonation,
+  // so write-env.sh adds api://<appId> post-deploy (else sign-in -> AADSTS500011).
   identifierUris: [
     'api://${name}-mcp-server'
   ]
