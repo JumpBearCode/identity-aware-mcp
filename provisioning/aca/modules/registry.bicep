@@ -19,11 +19,16 @@ var registryName = take('${toLower(replace(name, '-', ''))}acr${uniqueString(res
 resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
   name: registryName
   location: location
+  // Standard enables anonymous pull, which the ADC disk-image build needs to
+  // pull the sandbox image without credentials (it does not use the group MI's
+  // AcrPull). The image is just az + jq + bootstrap, so public pull is fine; for
+  // a private registry instead, pass registryCredentials to create_disk_image.
   sku: {
-    name: 'Basic'
+    name: 'Standard'
   }
   properties: {
     adminUserEnabled: true
+    anonymousPullEnabled: true
   }
 }
 
