@@ -42,7 +42,7 @@ resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
 // --- Entra identity (Graph, tenant scope) ---
 module identity 'modules/identity.bicep' = {
   name: 'identity'
-  scope: tenant()
+  scope: rg
   params: {
     name: name
   }
@@ -147,7 +147,7 @@ module rbac 'modules/rbac.bicep' = {
 // --- FIC: worker SP <- sandbox-group MI trust (Graph, tenant scope) ---
 module fic 'modules/fic.bicep' = {
   name: 'fic'
-  scope: tenant()
+  scope: rg
   params: {
     name: name
     tenantId: tenant().tenantId

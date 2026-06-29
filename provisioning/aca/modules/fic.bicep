@@ -15,7 +15,9 @@
 // the worker SP — no secret anywhere in the cloud. Wired last because it needs
 // the sandbox-group MI principalIds, which exist only after the groups deploy.
 
-targetScope = 'tenant'
+// RG-scoped (see identity.bicep) — the Graph extension still creates the FIC on
+// the worker app at tenant level.
+targetScope = 'resourceGroup'
 
 extension microsoftGraphV1
 

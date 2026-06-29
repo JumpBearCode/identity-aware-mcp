@@ -11,7 +11,12 @@
 // MI principalId, which only exists after sandbox-groups.bicep runs — so they
 // live in fic.bicep, wired last.
 
-targetScope = 'tenant'
+// RG-scoped (not tenant): the Microsoft.Graph extension routes apps/groups/
+// grants to Graph regardless of the ARM deployment scope, and an RG-scoped
+// module only needs RG-write — tenant-scoped modules would require
+// Microsoft.Resources/deployments/write at the tenant root, which nobody has by
+// default. The Graph objects created are still tenant-wide.
+targetScope = 'resourceGroup'
 
 extension microsoftGraphV1
 
