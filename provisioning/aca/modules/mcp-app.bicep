@@ -44,9 +44,7 @@ param actionSandboxGroup string
 param diagnoseSpAppId string
 param actionSpAppId string
 
-// --- redis / storage / blob ---
-param redisHost string
-param redisPort int
+// --- storage / blob ---
 param storageAccount string
 param blobContainer string
 param blobContainerResourceId string
@@ -55,7 +53,9 @@ param blobContainerResourceId string
 @description('Container image ref for the sandbox disk image (in ACR). Empty -> manager falls back to the public "ubuntu" disk.')
 param sandboxImage string = ''
 
-var redisUrl = 'redis://${redisHost}:${redisPort}'
+// Redis runs as a sidecar in this same app (see below), so the server reaches
+// it over loopback — no cross-app TCP ingress (which proved unreachable).
+var redisUrl = 'redis://localhost:6379'
 // Deterministic public FQDN (matches ingress.fqdn) so the OAuth Protected
 // Resource Metadata advertises the real https URL, not localhost.
 var publicBaseUrl = 'https://${name}-mcp.${environmentDefaultDomain}'
@@ -86,6 +86,16 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
     }
     template: {
       containers: [
+        {
+          // Sidecar redis — only the session->sandbox map (30-min TTL) + caches;
+          // loss self-heals via the 1h idle auto-delete, so no persistence/HA.
+          name: 'redis'
+          image: 'redis:7-alpine'
+          resources: {
+            cpu: json('0.25')
+            memory: '0.5Gi'
+          }
+        }
         {
           name: 'mcp-server'
           image: mcpImage

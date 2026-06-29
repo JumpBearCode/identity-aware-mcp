@@ -156,11 +156,18 @@ class UserAuthMiddleware(Middleware):
 
 
 async def _derive_ids(oid, fctx) -> tuple[str | None, str | None]:
-    """Session/Conversation ids — Redis sliding window when available."""
+    """Session/Conversation ids — Redis sliding window when available.
+
+    Never let a Redis hiccup hang or fail a tool call: fall back to transport
+    ids (degraded stickiness) on any error.
+    """
     transport_sid = getattr(fctx, "session_id", None)
     request_id = getattr(fctx, "request_id", None)
     if session_resolver is not None:
-        return await session_resolver.resolve(oid, transport_sid, request_id)
+        try:
+            return await session_resolver.resolve(oid, transport_sid, request_id)
+        except Exception as e:
+            logger.warning("session resolve via Redis failed (%s); using transport ids", e)
     return (transport_sid or oid), request_id
 
 
@@ -243,3 +250,23 @@ async def health(_request):
 
 
 app = mcp.http_app()
+
+# Ping Redis at startup: a clear connectivity log, and it warms the connection
+# pool on the server's event loop (so the first request never pays first-connect
+# latency or hits a loop-binding surprise). Wraps the FastMCP lifespan.
+if _redis is not None:
+    import contextlib
+
+    _orig_lifespan = app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _lifespan_with_redis_ping(app_):
+        try:
+            pong = await _redis.ping()
+            logger.info("redis startup ping ok: %s", pong)
+        except Exception as e:
+            logger.warning("redis startup ping FAILED: %s", e)
+        async with _orig_lifespan(app_):
+            yield
+
+    app.router.lifespan_context = _lifespan_with_redis_ping

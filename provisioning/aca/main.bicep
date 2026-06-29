@@ -88,16 +88,9 @@ module environment 'modules/environment.bicep' = {
   }
 }
 
-// --- Self-hosted redis ---
-module redis 'modules/redis.bicep' = {
-  name: 'redis'
-  scope: rg
-  params: {
-    name: name
-    location: location
-    environmentId: environment.outputs.environmentId
-  }
-}
+// Redis is a sidecar inside the MCP Container App (see mcp-app.bicep) — a
+// standalone redis Container App with internal TCP ingress proved unreachable
+// app-to-app, so we co-locate it and talk over localhost.
 
 // --- MCP server Container App ---
 module mcpApp 'modules/mcp-app.bicep' = {
@@ -121,8 +114,6 @@ module mcpApp 'modules/mcp-app.bicep' = {
     actionSandboxGroup: sandboxGroups.outputs.actionGroupName
     diagnoseSpAppId: identity.outputs.diagnoseSpAppId
     actionSpAppId: identity.outputs.actionSpAppId
-    redisHost: redis.outputs.redisHost
-    redisPort: redis.outputs.redisPort
     storageAccount: storage.outputs.storageAccountName
     blobContainer: storage.outputs.blobContainerName
     blobContainerResourceId: storage.outputs.blobContainerResourceId
@@ -184,7 +175,8 @@ output DIAGNOSE_SP_APP_ID string = identity.outputs.diagnoseSpAppId
 output ACTION_SP_APP_ID string = identity.outputs.actionSpAppId
 output DIAGNOSE_SANDBOX_GROUP string = sandboxGroups.outputs.diagnoseGroupName
 output ACTION_SANDBOX_GROUP string = sandboxGroups.outputs.actionGroupName
-output REDIS_HOST string = redis.outputs.redisHost
+// Redis is an in-app sidecar reached over localhost (no separate host).
+output REDIS_URL string = 'redis://localhost:6379'
 output STORAGE_ACCOUNT string = storage.outputs.storageAccountName
 output BLOB_CONTAINER string = storage.outputs.blobContainerName
 output BLOB_CONTAINER_RESOURCE_ID string = storage.outputs.blobContainerResourceId

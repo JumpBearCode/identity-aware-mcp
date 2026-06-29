@@ -19,7 +19,6 @@ outputs=$(az deployment sub show -n "$DEPLOYMENT_NAME" --query properties.output
 # so match case-insensitively.
 get() { jq -r --arg k "$1" 'to_entries[] | select((.key|ascii_upcase)==($k|ascii_upcase)) | .value.value' <<<"$outputs"; }
 
-redis_host=$(get REDIS_HOST)
 mcp_app_id=$(get MCP_APP_ID)
 
 # FastMCP advertises the OAuth scope as api://<appId>/user_impersonation, but
@@ -48,7 +47,7 @@ ACTION_SP_APP_ID=$(get ACTION_SP_APP_ID)
 DIAGNOSE_SANDBOX_GROUP=$(get DIAGNOSE_SANDBOX_GROUP)
 ACTION_SANDBOX_GROUP=$(get ACTION_SANDBOX_GROUP)
 
-REDIS_URL=redis://${redis_host}:6379
+REDIS_URL=$(get REDIS_URL)
 STORAGE_ACCOUNT=$(get STORAGE_ACCOUNT)
 BLOB_CONTAINER=$(get BLOB_CONTAINER)
 BLOB_CONTAINER_RESOURCE_ID=$(get BLOB_CONTAINER_RESOURCE_ID)
