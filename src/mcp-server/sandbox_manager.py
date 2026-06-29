@@ -84,6 +84,8 @@ class SandboxManager:
         auto_delete_seconds: int,
         blob_container_resource_id: str | None = None,
         blob_mountpoint: str = "/workspace",
+        index=None,
+        reaper_interval: int = 300,
         redis_client=None,
     ):
         self._cred = credential
@@ -105,12 +107,15 @@ class SandboxManager:
         self._auto_delete_seconds = auto_delete_seconds
         self._blob_container_resource_id = blob_container_resource_id or None
         self._blob_mountpoint = blob_mountpoint.rstrip("/") or "/workspace"
+        self._index = index
+        self._reaper_interval = reaper_interval
         self._redis = redis_client
 
         self._group_clients: dict[Group, object] = {}
         self._built_disk_ids: dict[str, str] = {}
         self._ensured_volumes: set[str] = set()
         self._locks: dict[str, asyncio.Lock] = {}
+        self._reaper_task: asyncio.Task | None = None
 
     @property
     def _blob_enabled(self) -> bool:
@@ -126,6 +131,7 @@ class SandboxManager:
         session_ttl = int(os.environ.get("MCP_SESSION_TTL", "1800"))
         sessions = SessionSandboxCache(RedisBackend(redis_client, ttl=session_ttl))
         profiles = UserProfileCache(RedisBackend(redis_client, ttl=None))
+        index = RedisBackend(redis_client, ttl=None, prefix="mcp:sbxidx")
 
         return cls(
             credential=DefaultAzureCredential(),
@@ -153,6 +159,8 @@ class SandboxManager:
             auto_delete_seconds=int(os.environ.get("SANDBOX_AUTO_DELETE_SECONDS", "3600")),
             blob_container_resource_id=os.environ.get("BLOB_CONTAINER_RESOURCE_ID") or None,
             blob_mountpoint=os.environ.get("BLOB_MOUNTPOINT", "/workspace"),
+            index=index,
+            reaper_interval=int(os.environ.get("SANDBOX_REAPER_INTERVAL", "300")),
             redis_client=redis_client,
         )
 
@@ -201,6 +209,11 @@ class SandboxManager:
 
             client = await self._create_sandbox(ctx, gclient, group)
             await self._sessions.set(ctx.user_oid, ctx.session_id, group, client.sandbox_id)
+            if self._index is not None:
+                await self._index.set(
+                    client.sandbox_id,
+                    {"oid": ctx.user_oid, "session": ctx.session_id, "group": group},
+                )
             if not await self._sessions.is_bootstrapped(client.sandbox_id):
                 await self._bootstrap(client, ctx, group)
                 await self._sessions.mark_bootstrapped(client.sandbox_id)
@@ -338,6 +351,7 @@ class SandboxManager:
         return f"mkdir -p {q} && cd {q} && {{ {command}\n}}"
 
     async def exec(self, ctx: SessionCtx, command: str) -> ExecResult:
+        self._ensure_reaper()
         client = await self.get_or_create(ctx)
         result = await client.exec(self._scope_to_workspace(ctx, command))
         stdout, t1 = _cap(result.stdout or "")
@@ -355,7 +369,7 @@ class SandboxManager:
     async def end_session(self, oid: str | None, session_id: str | None) -> None:
         """Delete both of a Session's sandboxes and clear its routing keys."""
         for group in ("diagnose", "action"):
-            sandbox_id = await self._sessions.get(oid, session_id, group)  # type: ignore[arg-type]
+            sandbox_id = await self._sessions.peek(oid, session_id, group)  # type: ignore[arg-type]
             if sandbox_id is None:
                 continue
             try:
@@ -366,8 +380,57 @@ class SandboxManager:
                 pass
             finally:
                 await self._sessions.delete(oid, session_id, group)  # type: ignore[arg-type]
+                if self._index is not None:
+                    await self._index.delete(sandbox_id)
+
+    # --------------------------------------------------------------- reaper
+    def _ensure_reaper(self) -> None:
+        """Start the background reaper once, on the running event loop."""
+        if self._reaper_task is None or self._reaper_task.done():
+            self._reaper_task = asyncio.create_task(self._reaper_loop())
+
+    async def _reaper_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._reaper_interval)
+            try:
+                await self.reap_orphans()
+            except Exception as e:  # never let the loop die
+                logger.warning("reaper pass failed: %s", e)
+
+    async def reap_orphans(self) -> None:
+        """Delete sandboxes whose Session window has lapsed (Session-level kill).
+
+        Lists each group's sandboxes, and for every one we created (it has a
+        reverse-index entry) checks whether its Session key is still live with a
+        non-sliding peek. Gone -> the Session ended -> delete it now rather than
+        waiting on the 1-hour platform auto-delete fallback.
+        """
+        if self._index is None:
+            return
+        for group in ("diagnose", "action"):
+            gclient = self._group_client(group)  # type: ignore[arg-type]
+            try:
+                async for sbx in gclient.list_sandboxes():
+                    meta = await self._index.get(sbx.id)
+                    if not meta:
+                        continue  # unmanaged — platform auto-delete handles it
+                    live = await self._sessions.peek(
+                        meta.get("oid"), meta.get("session"), meta.get("group")
+                    )
+                    if live == sbx.id:
+                        continue  # still owned by a live Session
+                    logger.info("reaping orphan %s sandbox %s", group, sbx.id)
+                    try:
+                        await gclient.begin_delete_sandbox(sbx.id)
+                    except ResourceNotFoundError:
+                        pass
+                    await self._index.delete(sbx.id)
+            except Exception as e:
+                logger.warning("reaper: listing %s failed: %s", group, e)
 
     async def aclose(self) -> None:
+        if self._reaper_task is not None:
+            self._reaper_task.cancel()
         for client in self._group_clients.values():
             try:
                 await client.close()  # type: ignore[attr-defined]

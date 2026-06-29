@@ -125,6 +125,10 @@ class SessionSandboxCache:
             await self._b.set(key, sandbox_id)  # sliding-window refresh
         return sandbox_id
 
+    async def peek(self, oid, session_id, group: str) -> str | None:
+        """Read without refreshing the window — for the reaper's liveness check."""
+        return await self._b.get(self._key(oid, session_id, group))
+
     async def set(self, oid, session_id, group: str, sandbox_id: str) -> None:
         await self._b.set(self._key(oid, session_id, group), sandbox_id)
 
