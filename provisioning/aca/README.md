@@ -63,7 +63,10 @@ MCP_SECRET=$(az ad app credential reset --id "$MCP_APP_ID" --display-name aca --
 az containerapp secret set -n "$MCP_APP_NAME" -g "$ACA_RESOURCE_GROUP" \
   --secrets mcp-client-secret="$MCP_SECRET"
 
-# 5. Point the MCP app at the real image + the sandbox disk source.
+# 5. Let the app pull from ACR via its managed identity (AcrPull was granted in
+#    rbac.bicep), then point it at the real image + the sandbox disk source.
+az containerapp registry set -n "$MCP_APP_NAME" -g "$ACA_RESOURCE_GROUP" \
+  --server "$REGISTRY_LOGIN_SERVER" --identity system
 az containerapp update -n "$MCP_APP_NAME" -g "$ACA_RESOURCE_GROUP" \
   --image "$REGISTRY_LOGIN_SERVER/mcp-server:latest" \
   --set-env-vars SANDBOX_DISK_IMAGE="$REGISTRY_LOGIN_SERVER/mcp-sandbox:latest"

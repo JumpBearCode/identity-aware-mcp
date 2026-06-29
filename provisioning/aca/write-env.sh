@@ -15,7 +15,9 @@ ENV_OUT="$(cd "$(dirname "$0")/../.." && pwd)/.env.aca"
 
 echo "==> Reading deployment outputs..."
 outputs=$(az deployment sub show -n "$DEPLOYMENT_NAME" --query properties.outputs -o json)
-get() { jq -r ".$1.value" <<<"$outputs"; }
+# ARM returns output keys with mangled casing (ACTION_GROUP_ID -> actioN_GROUP_ID),
+# so match case-insensitively.
+get() { jq -r --arg k "$1" 'to_entries[] | select((.key|ascii_upcase)==($k|ascii_upcase)) | .value.value' <<<"$outputs"; }
 
 redis_host=$(get REDIS_HOST)
 
