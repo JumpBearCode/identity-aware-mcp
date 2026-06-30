@@ -75,10 +75,22 @@ class RedisBackend:
 
 
 def make_redis_client(url: str):
-    """Async Redis client from a redis:// URL (decode_responses for JSON text)."""
+    """Async Redis client from a redis:// URL (decode_responses for JSON text).
+
+    Fail-fast timeouts: without them a single command blocks indefinitely if the
+    host is unreachable, which surfaces to MCP clients as an opaque "Timeout
+    connecting to server" hang. With them an unreachable Redis errors in ~5s and
+    callers can degrade gracefully.
+    """
     from redis.asyncio import from_url
 
-    return from_url(url, decode_responses=True)
+    return from_url(
+        url,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        health_check_interval=30,
+    )
 
 
 class GroupCache:

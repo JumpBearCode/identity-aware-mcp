@@ -23,7 +23,7 @@ import logging
 import os
 import shlex
 
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
 
 from blob import WorkspaceLayout
 from cache import (
@@ -196,7 +196,9 @@ class SandboxManager:
         # Serialize create-or-reuse per routing key so two concurrent calls in
         # the same Session don't each spin up a sandbox.
         async with self._lock(f"{ctx.user_oid}:{ctx.session_id}:{group}"):
-            sandbox_id = await self._sessions.get(ctx.user_oid, ctx.session_id, group)
+            sandbox_id = await self._redis_safe(
+                self._sessions.get(ctx.user_oid, ctx.session_id, group), default=None
+            )
             if sandbox_id is not None:
                 client = gclient.get_sandbox_client(sandbox_id)
                 try:
@@ -205,19 +207,39 @@ class SandboxManager:
                     return client
                 except ResourceNotFoundError:
                     logger.info("stale session sandbox %s gone; recreating", sandbox_id)
-                    await self._sessions.delete(ctx.user_oid, ctx.session_id, group)
+                    await self._redis_safe(
+                        self._sessions.delete(ctx.user_oid, ctx.session_id, group)
+                    )
 
             client = await self._create_sandbox(ctx, gclient, group)
-            await self._sessions.set(ctx.user_oid, ctx.session_id, group, client.sandbox_id)
+            await self._redis_safe(
+                self._sessions.set(ctx.user_oid, ctx.session_id, group, client.sandbox_id)
+            )
             if self._index is not None:
-                await self._index.set(
+                await self._redis_safe(self._index.set(
                     client.sandbox_id,
                     {"oid": ctx.user_oid, "session": ctx.session_id, "group": group},
-                )
-            if not await self._sessions.is_bootstrapped(client.sandbox_id):
+                ))
+            already = await self._redis_safe(
+                self._sessions.is_bootstrapped(client.sandbox_id), default=False
+            )
+            if not already:
                 await self._bootstrap(client, ctx, group)
-                await self._sessions.mark_bootstrapped(client.sandbox_id)
+                await self._redis_safe(self._sessions.mark_bootstrapped(client.sandbox_id))
             return client
+
+    @staticmethod
+    async def _redis_safe(coro, *, default=None):
+        """Await a Redis op; on failure log and return `default` (degrade, don't hang).
+
+        With fail-fast client timeouts a dead Redis errors in ~5s; we then run
+        without stickiness rather than failing the tool call.
+        """
+        try:
+            return await coro
+        except Exception as e:
+            logger.warning("redis op failed (%s); continuing degraded", e)
+            return default
 
     async def _create_sandbox(self, ctx: SessionCtx, gclient, group: Group):
         disk_kwargs = await self._resolve_disk(gclient, group)
@@ -268,16 +290,23 @@ class SandboxManager:
                 SandboxGroupIdentitySelector,
             )
 
-            await gclient.create_volume(
-                "workspaces",
-                type="AzureBlobByo",
-                storage_container_resource_id=self._blob_container_resource_id,
-                auth=AzureBlobByoManagedIdentityAuth(
-                    identity=SandboxGroupIdentitySelector(kind="SystemAssigned")
-                ),
-            )
+            try:
+                await gclient.create_volume(
+                    "workspaces",
+                    type="AzureBlobByo",
+                    storage_container_resource_id=self._blob_container_resource_id,
+                    auth=AzureBlobByoManagedIdentityAuth(
+                        identity=SandboxGroupIdentitySelector(kind="SystemAssigned")
+                    ),
+                )
+                logger.info("created workspace volume on %s", group_name)
+            except (ResourceExistsError, HttpResponseError) as e:
+                # create_volume is not idempotent: 409 GlobalVolumeAlreadyExists
+                # is fine (the volume already exists from a prior run/replica).
+                if getattr(e, "status_code", None) != 409:
+                    raise
+                logger.info("workspace volume already exists on %s", group_name)
             self._ensured_volumes.add(group_name)
-            logger.info("ensured workspace volume on %s", group_name)
 
     async def _resolve_disk(self, gclient, group: Group) -> dict:
         """Pick the sandbox source: prebuilt disk id > built-from-image > public."""
@@ -293,6 +322,17 @@ class SandboxManager:
             cached = self._built_disk_ids.get(group_name)
             if cached:
                 return cached
+            # Reuse an existing Ready image to skip the multi-minute build (e.g.
+            # across server restarts). Only build if the group has none.
+            try:
+                async for img in gclient.list_disk_images():
+                    state = (img.status.state if img.status else "") or ""
+                    if state in ("Ready", "Succeeded"):
+                        self._built_disk_ids[group_name] = img.id
+                        logger.info("reusing disk image %s on %s", img.id, group_name)
+                        return img.id
+            except Exception as e:
+                logger.warning("listing disk images on %s failed: %s", group_name, e)
             logger.info("building disk image for %s from %s", group_name, self._disk_image)
             poller = await gclient.begin_create_disk_image(self._disk_image, name="mcp-sandbox")
             image = await poller.result()

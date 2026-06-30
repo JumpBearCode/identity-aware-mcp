@@ -51,5 +51,8 @@ resource redis 'Microsoft.App/containerApps@2024-03-01' = {
   }
 }
 
-output redisHost string = redis.properties.configuration.ingress.fqdn
+// Use the app SHORT NAME, not ingress.fqdn. In-environment app-to-app TCP
+// resolves the short name; the `.internal.<domain>` FQDN is for VNet/private
+// access and times out from a peer app in the same environment.
+output redisHost string = redis.name
 output redisPort int = 6379
