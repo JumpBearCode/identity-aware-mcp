@@ -407,6 +407,83 @@ primary 回你 OK 时,这条写还没落到 replica;primary 一崩、replica 顶
 
 一句话:**"扩 web 副本"和"扩 Redis"是两码事。这套方案只需要一份"单一逻辑 Redis"**(standalone 或 primary+replica 都算),**不需要、也不应该把 Redis 拆成多个独立实例**。这里的锁 / 主从 / reaper 与数据库、编排系统是同一套原语的不同展厅,系统性对照见 [分布式原语-数据库-编排三者对照.md](分布式原语-数据库-编排三者对照.md)。
 
+### 4.9 超时编排:四个 timeout 各管一段
+
+§4.4 说了 TTL 与临界区长度的矛盾"没有完美解、只能靠保险"。这一节把**那些保险怎么配**讲透。一旦把 §4.5 那把 Redis 锁真正用起来,会牵出**四个不同的超时**,它们**各治一种故障,谁也替代不了谁**。最常见的错误是把"等锁的人"和"建 sandbox 的人"的超时混为一谈。
+
+**先声明一个互斥:长 TTL 和续租(watchdog)不能都要,二选一。** 它们是"临界区那么长(建 sandbox 几分钟),怎么让锁别中途过期"的**两个互斥答案**:
+
+| 方案 | 怎么配 | 崩溃后恢复 | 何时选 |
+|---|---|---|---|
+| **长 TTL** | 一次性给够(如 600s / 10min),**不续租** | 持锁者崩了要**空等满整个 TTL** 才释放 | 图省事、临界区上界确定 |
+| **续租 / watchdog** | 故意给**短 TTL**(如 30s)+ 后台每 ~10s `PEXPIRE` 续命 | 崩了 → 续租停 → **~TTL 秒就释放**,恢复快 | 想快速故障恢复(推荐) |
+
+**续租的前提就是短 TTL** —— 它存在的意义就是"让你不必给长 TTL"。**"长 TTL + 续租"是最坏组合**(恢复慢 + 续租复杂度,零收益),没人这么配。**选续租,就配短 TTL;要长 TTL,就别加续租。** (注意:续租 ≠ **Redlock**;Redlock 是 §4.4 那个"多独立 Redis 节点过半数"的算法,和这里"单节点短 TTL 续命"是两码事。)
+
+在"续租/长 TTL 二选一"之上,还要叠三道超时,凑齐**四个角色**:
+
+| 角色 | 谁 | 用什么超时 | 治哪种故障 |
+|---|---|---|---|
+| **持锁的创建者 A** | 正在建 sandbox 的副本 | **短 TTL + watchdog 续租** | A **崩溃**:续租停 → ~TTL 秒自动释放 |
+| **A 卡死但没崩**(还在续租) | 同上 | **create 操作超时**(临界区上界) | A **卡死**:建太久 → 主动 `cancel` + 释放锁 + 报错 → 换人 |
+| **等锁的副本 B** | 抢不到锁的那些 | **`blocking_timeout`** | B **无限等**:到点放弃 + 报错,**不动 A 的锁** |
+| **客户端** | MCP client | 请求超时 **≥ 冷启动** | client **过早超时**:别在 sandbox 建好前就放弃 |
+
+**关键区分:让 A 释放锁、换人去建的开关,是 "create 操作超时",不是 `blocking_timeout`。** 因为 A 卡死时 watchdog 会一直续租,只有给"建 sandbox 这个动作本身"设上界,超了才 `cancel`+释放。`blocking_timeout` 管的是 B 那边"等多久放弃",它**不会**让 A 松手。
+
+**排序铁律(每一层都要 > 正常冷启动):**
+
+```
+正常建 sandbox(~5min)
+  ≤  create 操作超时     (A 攥锁最多试这么久,超了让出)   ~6–8min
+  ≤  blocking_timeout    (B 最多等这么久去抢锁)           ~8–10min
+  ≤  client 请求超时      (client 最多等一次结果)          ≥ 上面
+```
+
+为什么必须 `create 超时 < blocking_timeout`:若反过来,**B 会在 A 正成功建着 sandbox 时就先给 client 报错** —— B 本可以等 A 建完直接复用,却白白失败了,同一 session 里 A 成功 B 失败,既浪费又不一致。所以要**刻意让等待方的耐心盖过创建方的一次尝试**:
+
+- **A 成功(常态)**:B 一直等 → A 写回 Redis → B 拿锁**命中复用**,不再建。✅ 这正是锁的价值:B 蹭到 A 的成果。
+- **A 卡死/失败**:A 到 create 超时让出锁;B 还在等(因为 blocking_timeout 更长)→ 轮到 B 试。✅
+
+> ⚠️ **现实天花板:** 上面整条链都 > 5 分钟,**前提是 client 愿意等 5 分钟以上**。很多 MCP client 默认请求超时只有几十秒 —— 那么**冷启动会在 client 侧先超时,再怎么调锁都没用**。这时唯一解法不是调 timeout,而是**暖池**(把冷启动 5min 变成亚秒 claim)。**暖池另开一节讨论**;这里只需记住:**timeout 编排解决"别重复建 + 别过早放弃",但"client 等不了冷启动"这个 UX 问题它解决不了。**
+
+**一个必须知道的坑:A "释放锁" ≠ 取消了 ARM 那边的创建。** A 在自己这边 `cancel`+释放,只是 A 不等了;**ARM 那台 sandbox 可能还在继续建、最后真建出来** → 成孤儿。加上 B 也建一台 → 两台。所以"让出锁换人试"是对的,但**代价是可能多一台孤儿**(Reaper 收,§4.10)。这又是"外部副作用不可回滚"(见对照文档),无法根除。
+
+**而且"换人去试"不总有用:** 失败**局部于 A**(A 进程卡、A 到 ARM 网络断)→ 换 B **有用**;失败在**共享资源 ARM**(ARM 挂 / 限流)→ B 去试**照样失败**,只是白烧重试。所以**限定重试次数**,超了把错误如实抛给用户("sandbox 暂时起不来"),别让请求无限打转。
+
+### 4.10 故障收敛与纵深防御:worst case 到底多糟
+
+**A、B 都失败后,用户在同一 session 内再问 —— 就是"对同一个 key 重跑 create"。**
+
+- **同一 session**:`session_id` 按用户 30min 滑动窗口派生,窗口内再问,**即使是新的 conversation 也是同一个 `session_id`**(`conversation_id` 不进路由,只用于 Blob 分目录)。
+- **同一 key**:`(oid, session, group)` 没变 → 同一个 routing key。
+- **等于重跑 create**:A、B 都失败 → Redis 里这个 key 没有有效 sandbox_id(没写进去,或写了个半成品、`ensure_running` 会失败并清掉)→ 下次同-key 调用**必然 miss → 重走 create**。
+
+**这是幂等收敛的:** 同一个 key 无论重试多少次,目标都是"给这个 (oid,session,group) 搞出**它那一台** sandbox"。失败尝试的残骸由 Reaper / auto_delete 清,重试成功的那台绑定到 key,**最终收敛到"一个 key 一台"**。
+
+> **一个反向索引的缝隙:** 若 A 在**建成功之后、写 Redis 之前**崩了,那台 sandbox 在 Redis 里**毫无记录**(正反向都没写)→ Reaper 靠反向索引找不到它(当成"非我所建"跳过)→ **只能等 1h `auto_delete` 兜底**。这是"外部副作用先于本地记账"的固有缝隙,概率低、有界(1h),但存在。
+
+**纵深防御:三道独立的网 + 一条安全底线。** §4.4 讲过"锁是效率锁不是正确性锁",这里把兜底关系画清:
+
+| 层 | 机制 | 作用 | 独立吗 |
+|---|---|---|---|
+| 1 | **分布式锁**(§4.5,按 §4.9 调超时) | 挡住**绝大多数**双建 | 一层(§4.4/§4.9 是调它,不是另加) |
+| 2 | **Reaper**(每 ~300s) | 收掉漏网孤儿(反向索引认出 `live≠自己`) | ✅ 独立 |
+| 3 | 平台 **auto_delete(1h)+ auto_suspend(5min)** | 连 Reaper 都挂了的最后兜底 | ✅ 独立 |
+| — | **never-rebind 不变量**(§5.1) | 保证孤儿**绝不**绑给别的 user | 正确性底线,与上面无关 |
+
+**worst case 到底多糟 —— 别被"1 小时"吓到:**
+
+- **孤儿通常 ~5 分钟内就被 Reaper 收掉**,不是熬满一小时。Reaper 每 ~300s 扫一次,下一轮就认出这台孤儿(它的反向索引 key 现在指向的是**赢的那台** sbx-2,`live(sbx-2) != sbx-1` → 删)。
+- 而且孤儿没人用 → **5 分钟 auto_suspend 先挂起**(停止计算计费),即便还没删也基本不烧钱。
+- **1 小时的 `auto_delete` 只是"连 Reaper 都挂了"的最终兜底**,不是正常路径的等待时间。
+
+所以精确的 worst case:
+
+> **上述所有条件全满足 → 多建一台孤儿 → 通常 5 分钟内被 Reaper 删(且 5 分钟起已挂起不计费);只有 Reaper 也挂了,才轮到 1 小时 auto_delete。** 代价只是"几分钟的一点点浪费",**不是正确性/安全问题** —— `never-rebind` 保证那台孤儿永不绑给另一个用户,无跨用户串号或数据泄露。
+
+**一句话分工:锁负责省钱,Reaper 负责收尾,`never-rebind` 负责安全,三者各管一段。**
+
 ---
 
 ## 5. Reaper:current status
@@ -490,7 +567,7 @@ reaper 的意义:**session 一结束就尽快删,不用等平台那 1 小时 `au
 | 副本数 N | **N 个 reaper 在重复扫同一批 sandbox** |
 | 正确性 | ✅ 基本 OK。两个 reaper 抢删同一个 → 一个成功,另一个收 `ResourceNotFoundError` 被 `:465` 吞掉,不出错 |
 | 代价 | ❌ 浪费:N 倍的 `list_sandboxes` + 删除调用;N 大了有 ARM API 限流(throttling)风险 |
-| 兜底 | reaper 全挂也不致命:平台层 `auto_suspend`(默认 300s 挂起)+ `auto_delete`(默认 3600s 删除,见 `_apply_idle_autodelete` `:342`)仍会自我回收 |
+| 兜底 | reaper 全挂也不致命:平台层 `auto_suspend`(默认 300s 挂起)+ `auto_delete`(默认 3600s 删除,见 `_apply_idle_autodelete` `:342`)仍会自我回收。**注:正常路径下孤儿通常先被 reaper ~5min 删,1h 只是"连 reaper 都挂了"的最终兜底,见 §4.10** |
 
 ### 5.4 N 个 reaper 并行扫:时序图
 
@@ -592,13 +669,70 @@ commit message 里 *"distributed lock on the routing key"* 和 *"single reaper l
 
 ## 9. Follow-up checklist
 
-> ⚠️ **前置认知:下面前两项(分布式锁 / reaper 选主)只在 `maxReplicas > 1` 时才有意义。** 当前 `provisioning/aca/modules/mcp-app.bicep:120-121` 为 `minReplicas = maxReplicas = 1`(单实例),`asyncio.Lock` 与"每副本一个 reaper"都已足够正确 —— 这两项是**扩到多实例前**要补的前瞻项,**不是现存 bug**。触发条件与具体场景见 §3.3。
+> ⚠️ **前置认知:下面前两项(分布式锁 / reaper 选主)只在 `maxReplicas > 1` 时才有意义。** 当前 `provisioning/aca/modules/mcp-app.bicep:120-121` 为 `minReplicas = maxReplicas = 1`(单实例),`asyncio.Lock` 与"每副本一个 reaper"都已足够正确 —— 这两项是**扩到多实例前**要补的前瞻项,**不是现存 bug**。触发条件与具体场景见 §3.3。**落地优先级、要不要 watchdog、这套算不算过度工程,见 §10。**
 
 - [ ] **routing-key distributed lock**:`get_or_create` 把 `self._lock(key)` 换成 Redis 锁(`redis-py` `Lock`,`timeout` 盖过建 sandbox 最坏时间;必要时加 watchdog 续租)。参 §4.5。**仅当 `maxReplicas > 1` 才需要**。
+- [ ] **超时编排**:落地分布式锁时,`长 TTL` 与 `watchdog 续租` 二选一(§4.9);并按铁律配 `create 操作超时 < blocking_timeout < client 请求超时`,且都 > 冷启动。参 §4.9。
 - [ ] **reaper leader election**:`_reaper_loop` 每轮先抢 `reaper:leader`(`SET NX EX`),非 leader 跳过。参 §6.1。
 - [ ] (可选)**group_cache 上 Redis**:`InMemoryBackend` → `RedisBackend`,跨副本共享组成员缓存。参 §8。
 - [ ] (可选)**reaper 物理隔离**:升级到独立 `min=max=1` Container App / ACA Job,让 web 层彻底无状态。参 §6 选项 4。
 - [ ] 压测验证:N≥2 副本下,同一 session 高并发首调**只产生一台 sandbox**;reaper **每轮只有一个副本**真正执行删除。
+
+---
+
+## 10. 落地判断:冷启动其实很快,这套该建到什么程度
+
+> §3–§4 用 "~5min 建 sandbox" 作为**举例占位数字**推导竞态与超时。**实际体感是秒级。** 这一节做诚实校准,并回答"三重保险(watchdog + create-timeout + blocking-timeout)+ Reaper 现在就一步到位,是不是过度工程"。§4.9/§4.10 里的 "~5min" 请按本节理解为"盖过实测冷启动"的**相对量级**,不是实测值。
+
+### 10.1 冷启动其实很快 —— 量级校准
+
+VS Code 里 approve 完很快返回,说明冷启动远没有 5min 那么慢。四条原因:
+
+1. **microVM 秒级启动**:ACA Sandbox 底层是 Firecracker 一类轻量 microVM,秒级(甚至亚秒)启动就是卖点。
+2. **镜像预建、复用,create 不含 build**:`_ensure_disk_image` 先 `list_disk_images` 复用现成 Ready 镜像(§8 / `:327`),不每次现 build。
+3. **bootstrap 是几个 API 往返**:FIC `az login` + `az account set` + 挂 Blob 卷(create 时 `volumes=` 一起挂),秒级。
+4. **多数调用根本没在 create**:同一 session 第 2 次起 Redis 命中 → 复用(甚至从 `auto_suspend` 内存快照 resume)→ 亚秒,不进 create 分支。
+
+**唯一的分钟级例外**:全新部署 / 换新镜像版本后的**第一台**,`_ensure_disk_image` 要现 build 镜像(分钟级),但**一次性、可摊销**,日常碰不到。
+
+这把前面几个"痛点"的严重性大幅缩水:
+
+| 之前(按 5min 举例) | 秒级冷启动下的实况 |
+|---|---|
+| §4.9 "client 超时 < 冷启动"是大天花板 | **基本不是问题**,几十秒 client 超时轻松盖过 |
+| 锁要长 TTL + watchdog | **短/宽松固定 TTL 就够**,watchdog 大概率不必 |
+| §3.3 竞态窗口分钟级、易撞 | **缩到秒级,更难撞** |
+| 暖池是刚需 | **降级为延迟打磨**,非必需 |
+
+> ⚠️ **诚实保留:上面是从架构组件推的量级,没有实测秒数。** 拿准数只需在 `_create_sandbox` / `_bootstrap` 前后打时间戳,跑几次拿三档:首建(冷)/ 命中(warm)/ 全新镜像首台(build)。测完把 §4.9 的占位数换成实测值,"要不要 watchdog"也就有了答案。
+
+### 10.2 这算过度工程吗 —— 三重保险 + Reaper 建到什么程度
+
+结论:**不是全过度,但 watchdog 这一块现在上属于 premature。** 逐块判断(成本 × 单实例现在的收益 × 建议):
+
+| 部件 | 成本 | 现在(单实例)收益 | 建议 |
+|---|---|---|---|
+| 分布式锁(redis-py `Lock`) | 低,近 drop-in | **零**(asyncio.Lock 已够);甚至略差(+1 Redis 往返 + 新失败面) | ✅ 值得,但纯属 `maxReplicas>1` 铺路 |
+| `blocking_timeout` | 极低(一个参数) | 防等待方无限挂 | ✅ 无脑做 |
+| create 操作超时(`asyncio.wait_for`) | 低 | **有独立价值**(卡死 create 不占锁 / 不挂 client,单实例也受益) | ✅ 做 |
+| **watchdog 续租** | **中,最费** | **≈零**(秒级 create 配宽松固定 TTL,watchdog 一次都不触发) | ⚠️ **defer** |
+| Reaper | 已实现 | 已兜底 | ✅ 现成;leader 选主随锁(N>1)一起上 |
+
+**为什么单挑 watchdog defer:** 它的全部意义是"临界区 ≈ 或 > TTL",而秒级 create 让这前提消失。更要命的是——**你没法验证它**:要测 watchdog 正确续命,得造一个"create 超过基础 TTL"的场景,而这正是你缺的 timeline。等于 ship 一段当前 smoke test 覆盖不到的分支。而且它边际安全很小(Reaper 已兜底双建孤儿),以后要加又是**加法式**改动、很便宜。**低边际安全 + 现在无法验证 + 以后加便宜 = 教科书级"该 defer"。**
+
+**真正的卡点是你缺的输入:** lock / blocking / create-timeout 的**机制**值得建,但它们的**参数**(各 timeout 设多少)全依赖 create 时间分布。没测 = 机制搭好了、旋钮乱拧。所以最高性价比的第一步不是写锁,是**先测 create timeline**。
+
+**roadmap 铰链:** 分布式锁的全部价值 = `maxReplicas>1` 那一刻。近期要扩多副本 → 现在建锁 + blocking + create-timeout + reaper leader 是合理提前量;短期就单实例也不打算扩 → 连锁都可先不写(别给创建热路径平白加 Redis 依赖),`asyncio.Lock` 挺好。
+
+**建议落地顺序:**
+
+1. **先测 create timeline**(打时间戳)—— 无脑先做,解锁一切参数决定。
+2. **确认多副本 roadmap** —— 决定锁现在建还是以后建。
+3. 要建就建三样:**分布式锁**(建议**两层**:保留本地 `asyncio.Lock` + 叠 Redis 锁,Redis 挂了仍能单机降级)+ **`blocking_timeout`** + **create 操作超时**,参数用实测值。
+4. **watchdog 先不写**,用宽松固定 TTL(> 实测最坏 create + 倍数余量);等 measurement 显示 create 逼近 TTL 时再加(那时也终于能测它)。
+5. Reaper 已有;leader 选主与锁同批(N>1)上。
+
+**一句话:lock + blocking + create-timeout + Reaper 是合理的一步到位;watchdog 是该等数据那块。摘掉它,复杂度掉一大截,鲁棒性几乎不损失。**
 
 ---
 
