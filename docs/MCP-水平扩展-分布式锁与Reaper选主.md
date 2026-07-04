@@ -148,6 +148,33 @@ sequenceDiagram
 
 代价:多开一台 sandbox + 多跑一遍 bootstrap(`az login`)。孤儿最后会被 reaper 或平台 1 小时 `auto_delete` 兜底,但这本不该发生。
 
+### 3.3 什么时候"同一个 key"真的会被多实例同时 create —— 本项目的具体触发场景
+
+> **前置条件(缺一不可,AND):** 这个孤儿竞态**只有**同时满足下面三条才发生:
+> 1. **同一个 routing key** `(oid, session, group)`;
+> 2. 两个调用**并发在飞**(时间上重叠,不是一前一后);
+> 3. 落在**不同 instance** 上(或说:没有跨实例锁在管)。
+>
+> ⚠️ **当前 `provisioning/aca/modules/mcp-app.bicep:120-121` 是 `minReplicas = maxReplicas = 1`(单实例)** —— 条件 3 不成立,`asyncio.Lock` 已完整覆盖同-key 并发,**这个竞态今天一台孤儿都不会产生**。下面讨论的是**你哪天把 `maxReplicas` 调到 ≥2 或开自动扩缩之后**的前瞻场景。
+
+**为什么"串行多次调用"不算:** 同一 session 当然会调很多次 tool,但只要客户端是**串行**的(调一个 → 等结果 → 再调下一个),第 2 次发出时第 1 次早已返回、sandbox 早已写进 Redis,于是第 2 次**命中复用**,根本不进 create 分支。**串行调用即使跨实例也安全。** 真正制造"并发同-key"的,是下面这几种:
+
+| # | 触发场景(本项目具体化) | 为什么撞成同一个 key | 现实概率 |
+|---|---|---|---|
+| **1** | **模型一轮里并行发多个同-group 工具调用**。例:用户问"同时看下资源组 A 和 B 的状态",模型在一条消息里发**两个 `diagnose_bash`**,客户端(VS Code / Claude Desktop)并发派发 | 两个都是 `group=diagnose` + 同一 `(oid, session)` → **同一个 key**;ACA ingress 把两个并发请求分到不同 replica | ★★★ **最可能**。并行工具调用是常态 |
+| **2** | **同一 session 内两个 conversation 并发**:session 是 30min 滑动窗口、跨 conversation 复用;两个聊天同时首次触碰 diagnose | `conversation_id` **不进路由**(见迁移方案),两个 conversation 派生**同一个 `session_id`** → 同一个 key | ★★ 少见但可能 |
+| **3** | **客户端超时重试**:建 sandbox 要几分钟,若客户端超时短于建的耗时,它可能**重发**,而原请求还在飞 | 重发的是**同一个 tool call**、同一个 key;重试落到另一 replica,原 replica 还在建 | ★★ 取决于客户端超时 |
+| **4** | 正常**串行**多次调用 | — | ✗ 不撞(后来的都命中缓存) |
+| **5** | 并行发 `diagnose_bash` + `action_bash` | 一个 `group=diagnose`、一个 `group=action` → **两个不同 key** | ✗ 不撞(本就该各建一台,正确行为) |
+
+**注意场景 5:** 不同 group 并行是**正确**的,该建两台(一台只读 diagnose、一台可写 action,身份边界不同)。锁**不应该**、也**不会**把它们串起来 —— key 不同,锁对象也不同(§3.1)。
+
+**放大器 —— 为什么一旦并发就很容易中招:** 别的系统里 check-then-act 的窗口是微秒级,撞上要靠运气;**本项目里 ② 建 sandbox 要几分钟**,窗口是**分钟级**。场景 1/2/3 只要两个调用落在这几分钟内、且第一台还没写回 Redis,第二个必然也 miss。好消息是:**这个窗口只在每个 `(session, group)` 的"首次 create"存在**;sandbox 一旦进了 Redis,后续全是命中,再无竞争。
+
+**一句话:** 对你这个 app,**最现实的孤儿来源是"模型在一轮里并行调了两个同一 group 的 bash",而 web 层又恰好扩到了多实例**。这两件事**同时**成立时,不加分布式锁就会漏出孤儿(reaper 兜底,但本不该发生)。
+
+> **另一条便宜的缓解(非分布式锁):** ACA ingress 支持 **session affinity(粘性会话)**,把同一客户端的请求钉在同一 replica 上 → 同-key 并发又回到同一把 `asyncio.Lock`。它能挡住**场景 1**(同一客户端的并行调用),但挡不住**场景 2/3**(不同 conversation/客户端、或原 replica 不可达后的重试);且**前提是客户端会带上 affinity cookie**(标准浏览器/HTTP 客户端会,MCP streamable-HTTP 客户端需确认)。所以它是**部分缓解**,真要严谨还是 §4.5 的 Redis 锁。
+
 ---
 
 ## 4. 分布式锁(distributed lock):原理拆解
@@ -230,22 +257,44 @@ end
 
 ### 4.4 TTL 与临界区长度的矛盾(本项目的真实痛点)
 
-回看第 3 节那段临界区:② 建 sandbox 要**几分钟**,④ 还要跑 `az login` —— 而且 **bootstrap 也在锁里**(`get_or_create` 整段都在 `async with` 内)。如果 TTL 只给 30s,**锁会在 sandbox 还没建完时就过期**,另一个副本拿到锁又去建,孤儿回来了(正是 4.3 那张图)。
+先把两个**极易混为一谈**的问题分开 —— §4.3 只解决了第一个:
 
-两条出路:
+| 问题 | 是什么 | token+Lua 解决了吗 |
+|---|---|---|
+| **P1 · 误删(§4.3)** | 锁过期后你去 `DEL`,删掉的是**别人**刚合法拿到的锁 | ✅ 解决(只删自己 token 的) |
+| **P2 · 锁中途过期(本节)** | create 比 TTL 长 → 锁**自己**过期 → 别人合法拿到 → **两副本同时在临界区** → 双建孤儿 | ❌ **token 完全没碰它** |
 
-1. **TTL 设得足够长**(盖过最坏建 sandbox 时间,如 600s)。简单,但某副本真崩了要等满 TTL 才释放。
-2. **续租 / watchdog(lease renewal)**:持锁期间起个后台协程,每隔几秒 `PEXPIRE` 续命,临界区做完再释放。锁可以设短 TTL(快速故障恢复),又不会中途过期。
+§4.3 那张图是 **P1**(A 误删 B 的锁)。加了 token 之后 P1 消失,但 **A、B 仍会同时在建 sandbox** —— 这是 **P2**,和"删得对不对"无关,纯粹是**锁的存活时间 < 临界区时间**。
 
-```python
-async def _watchdog(redis, lock_key, token, ttl_ms, interval):
-    while True:
-        await asyncio.sleep(interval)          # 比如 ttl 的 1/3
-        # 同样要 token 校验后再续(Lua),避免给别人的锁续命
-        await redis.eval(RENEW_LUA, 1, f"lock:{lock_key}", token, ttl_ms)
-```
+回看第 3 节临界区:② 建 sandbox 要**几分钟**、④ 还要 `az login`,而且 **bootstrap 整段都在锁里**(`get_or_create` 整段都在 `async with` 内)。TTL 一旦短于这段,P2 必现。
 
-> **Redlock** 是 Redis 作者提出的、面向"多个独立 Redis 节点"的分布式锁算法(过半数节点抢到才算持锁),解决单点 Redis 挂掉时锁的安全性。我们现在单 Redis,**不需要 Redlock**;了解它是"分布式锁严谨版"即可。
+**三档解法,诚实排序:**
+
+1. **TTL 设够长**(600s 盖过最坏建 sandbox 时间)。**降低概率,不能消除**:你永远无法 100% 确定 TTL 盖住了最坏情况(ARM 抽风、GC 停顿);且副本真崩了要空等满 TTL 才释放。
+2. **watchdog 续租(lease renewal)**:短 TTL + 后台协程每 TTL/3 `PEXPIRE` 续命。**活着就不中途过期,崩了很快释放** —— 比固定长 TTL 好。**但仍有洞**:进程"没死但卡住"(长 GC、事件循环阻塞、到 Redis 的网络分区)时续租跑不了 → 锁过期 → 别人拿到 → 卡住的进程醒来还以为自己持锁 → 又两个持锁者。窗口大大变窄,**没关死**。这就是 Martin Kleppmann 对 Redlock 的经典批评。
+
+   ```python
+   async def _watchdog(redis, lock_key, token, ttl_ms, interval):
+       while True:
+           await asyncio.sleep(interval)          # 比如 ttl 的 1/3
+           # 同样要 token 校验后再续(Lua),避免给别人的锁续命
+           await redis.eval(RENEW_LUA, 1, f"lock:{lock_key}", token, ttl_ms)
+   ```
+
+3. **fencing token(理论上唯一真正安全的解法)**:锁每次发一个**单调递增号**,**被保护的资源**校验"只收比见过的更大的号",旧持锁者的写被拒 —— 无视 TTL/卡顿。**但前提是资源方支持校验**。
+
+> **根本限制:基于 TTL 的分布式锁,对一段可能超过 TTL 的临界区,永远给不了完美互斥。** 这不是实现不到位,是原理性的(Kleppmann, 2016)。想彻底安全,只能靠 fencing token,而它要求**资源方配合**。
+
+**那本项目怎么办?—— 不追求完美的锁,靠纵深防御(defense in depth)。**
+
+- 关键认清:**这把锁是"效率锁"不是"正确性锁"**(详见 §4.8)。它失效的代价**有界且自愈**:多一台孤儿,reaper + 平台 `auto_delete` 收掉。1:1 绑定(不跨用户)由 **create-binds-unique + never-rebind** 独立守住(§5.1),**与锁无关**。
+- 所以正确姿势 = **锁(长 TTL + watchdog)把双建压到罕见** + **reaper 对账保证漏网的也会被清**。**锁负责省钱,reaper 负责正确。**
+
+**能不能把 fencing 思路落到资源层?(确定性命名)** 最干净的真·互斥,是让**平台自己**拒绝重复:用 routing key 派生一个**确定性的 sandbox 名**,第二次并发建因**重名冲突**被拒 —— 等价于数据库的 `INSERT ... ON CONFLICT` / 唯一约束,**TTL 无关、真正安全**。
+
+> ⚠️ **但 ACA Sandbox 平台不支持这条**(2026-02-01-preview,已查官方文档):**`sandbox_id` 由平台 mint,调用方不能指定**;`labels` 能在建时打、能 `list_sandboxes(labels=…)` 查,但 **labels 无唯一约束**(多台可同 label),且**没有 conditional / idempotent / create-if-absent**。换句话说**平台层没有任何原生互斥原语**——不是我们没用,是它没有。于是"**尽力而为的锁 + reaper 对账**"在这个平台上**不是选择,是被逼出来的最优解**。
+
+> **Redlock** 是 Redis 作者提出的、面向"多个独立 Redis 节点"的分布式锁算法(过半数节点抢到才算持锁),解决单点 Redis 挂掉时锁的安全性。我们现在单 Redis(§4.8),**不需要 Redlock**;了解它是"分布式锁严谨版"即可。
 
 ### 4.5 别自己造轮子:`redis-py` 自带 `Lock`
 
@@ -309,6 +358,54 @@ sequenceDiagram
 |---|---|---|---|
 | 分布式锁(4.5) | 锁住整段查—建—写 | 低,有现成库 | 默认推荐,先上这个 |
 | claim + poll(4.7) | 只锁一次原子认领 | 高,自己管状态机 | 建 sandbox 极慢、并发极高、不想让副本阻塞时 |
+
+### 4.8 如果 Redis 本身有多个实例:锁还成立吗
+
+前面 4.1–4.7 有一个**没写明的前提:所有 web 副本都在跟"同一个、权威的" Redis 说话**。§4.1 那句"key 存在 = 锁被占着",只有在**大家问的是同一个 Redis** 时才成立。一旦把 **Redis 本身**也做成"多个实例",就得分情况——而且结论差别很大,因为"多 Redis"有三种完全不同的含义。
+
+| 拓扑 | 是什么 | 锁还成立吗 |
+|---|---|---|
+| **A. 主从 / Sentinel**(一个逻辑 Redis,primary + 只读 replica,故障自动切换) | 写永远只走 **primary**,replica 是异步复制的只读副本 | **平时成立**(所有 `SET NX` 都打到同一个 primary);**只有 failover 一瞬有安全窗口**——见下 |
+| **B. Redis Cluster**(分片,多 master 各管一部分 key) | 一个 lock key 用哈希落到**唯一一个分片的 master** 上 | **本质同 A**。分片只解决容量,**不增强也不削弱锁安全**;每个分片仍是"单 master + 异步 replica",failover 窗口照在 |
+| **C. N 个互相独立的 Redis**(真·多实例,彼此不复制,副本各连各的) | 没有"单一真相"了 | **彻底失效** ❌——副本 A 在 redis-1 上 `SET NX` 成功,副本 B 在 redis-2 上也成功,两边都以为自己持锁,互斥归零 |
+
+**情况 C 应该让你想起 §1 的 sidecar 反例**:锁本身也是一种**共享状态**,和路由表有完全相同的要求——必须有一份**单一的、大家都认的真相**。把 Redis 拆成 N 个独立实例,等于把路由表也拆成 N 份,共享状态直接破功。真要在 N 个独立节点上安全上锁,那正是 §4.4 提的 **Redlock**:必须在**多数节点(N/2+1)**都抢到才算持锁。
+
+**即便是最常见的主从(A),也有一个无法用单 Redis 消除的安全窗口**,根源是**异步复制**:
+
+```mermaid
+sequenceDiagram
+    participant A as Replica A
+    participant P as Redis primary
+    participant R as Redis replica → 新 primary
+    participant B as Replica B
+    A->>P: SET lock:key tokenA NX   → OK
+    Note over P,R: 这条还没复制给 replica……
+    P->>P: primary 崩溃
+    R->>R: replica 被提升为新 primary(身上没有 lock:key!)
+    B->>R: SET lock:key tokenB NX   → OK
+    Note over A,B: A、B 同时"持锁" → 互斥被打破
+```
+
+primary 回你 OK 时,这条写还没落到 replica;primary 一崩、replica 顶上,锁就丢了。这不是配置问题,是主从架构的**固有取舍**。彻底解法是 **fencing token**(锁每次发一个单调递增的号,被保护的资源拒绝旧号)——但要求**资源方配合校验**,本项目资源(ARM 建 sandbox + `SET session:key`)并不校验,所以我们不走这条路。
+
+**但对本项目,这不致命——因为这把锁是"效率锁"而非"正确性锁"。** 回顾 §5.1:1:1 绑定(不跨用户串号)是靠 **create-binds-unique + never-rebind** 独立守住的,**跟这把锁无关**。所以就算锁在 failover(A)或多实例(C)下失效,最坏结果是:
+
+- 两副本各建一台 → `SET session:key` 后写者赢 → 另一台成**孤儿** → reaper 删掉,平台 1h `auto_delete` 兜底;
+- **不会**跨用户数据泄露——每台 sandbox 仍绑定到唯一 routing key,只是同一 key 短暂多出一台。
+
+它的失败模式是**有界的**(多一台孤儿,能自愈),不是灾难。**reaper leader 那把锁(§6.1)更无所谓**:双主一瞬间就退回到"N 个 reaper 幂等重复扫"(§5.3 已论证安全)。
+
+**结论 / 部署建议:**
+
+| Redis 怎么部署 | 这套锁的处境 | 建议 |
+|---|---|---|
+| **单实例 standalone**(现状 `dataops-aca-redis`) | 完全正确,无窗口 | ✅ 够用 |
+| **主从 / Sentinel**(为高可用) | 平时正确,failover 有短暂窗口 → 偶发一台孤儿 | ✅ 可接受,reaper 兜底;别拿它当正确性锁 |
+| **Redis Cluster**(为容量) | 同上,单 key 落单分片 | ✅ 可接受;多 key 的 Lua 要同 slot(加 hash tag) |
+| **N 个互相独立的 Redis** | ❌ 锁完全失效 | **别这么干**;真要多独立节点才上 Redlock |
+
+一句话:**"扩 web 副本"和"扩 Redis"是两码事。这套方案只需要一份"单一逻辑 Redis"**(standalone 或 primary+replica 都算),**不需要、也不应该把 Redis 拆成多个独立实例**。这里的锁 / 主从 / reaper 与数据库、编排系统是同一套原语的不同展厅,系统性对照见 [分布式原语-数据库-编排三者对照.md](分布式原语-数据库-编排三者对照.md)。
 
 ---
 
@@ -495,7 +592,9 @@ commit message 里 *"distributed lock on the routing key"* 和 *"single reaper l
 
 ## 9. Follow-up checklist
 
-- [ ] **routing-key distributed lock**:`get_or_create` 把 `self._lock(key)` 换成 Redis 锁(`redis-py` `Lock`,`timeout` 盖过建 sandbox 最坏时间;必要时加 watchdog 续租)。参 §4.5。
+> ⚠️ **前置认知:下面前两项(分布式锁 / reaper 选主)只在 `maxReplicas > 1` 时才有意义。** 当前 `provisioning/aca/modules/mcp-app.bicep:120-121` 为 `minReplicas = maxReplicas = 1`(单实例),`asyncio.Lock` 与"每副本一个 reaper"都已足够正确 —— 这两项是**扩到多实例前**要补的前瞻项,**不是现存 bug**。触发条件与具体场景见 §3.3。
+
+- [ ] **routing-key distributed lock**:`get_or_create` 把 `self._lock(key)` 换成 Redis 锁(`redis-py` `Lock`,`timeout` 盖过建 sandbox 最坏时间;必要时加 watchdog 续租)。参 §4.5。**仅当 `maxReplicas > 1` 才需要**。
 - [ ] **reaper leader election**:`_reaper_loop` 每轮先抢 `reaper:leader`(`SET NX EX`),非 leader 跳过。参 §6.1。
 - [ ] (可选)**group_cache 上 Redis**:`InMemoryBackend` → `RedisBackend`,跨副本共享组成员缓存。参 §8。
 - [ ] (可选)**reaper 物理隔离**:升级到独立 `min=max=1` Container App / ACA Job,让 web 层彻底无状态。参 §6 选项 4。
@@ -503,4 +602,4 @@ commit message 里 *"distributed lock on the routing key"* 和 *"single reaper l
 
 ---
 
-*关联文档:* [MCP-用户隔离与Redis设计.md](MCP-用户隔离与Redis设计.md) · [ACA-Sandbox-迁移方案.md](ACA-Sandbox-迁移方案.md) · [MCP-鉴权-缓存与凭据演进.md](MCP-鉴权-缓存与凭据演进.md)
+*关联文档:* [分布式原语-数据库-编排三者对照.md](分布式原语-数据库-编排三者对照.md) · [Redis-基本语法入门.md](Redis-基本语法入门.md) · [MCP-用户隔离与Redis设计.md](MCP-用户隔离与Redis设计.md) · [ACA-Sandbox-迁移方案.md](ACA-Sandbox-迁移方案.md) · [MCP-鉴权-缓存与凭据演进.md](MCP-鉴权-缓存与凭据演进.md)
