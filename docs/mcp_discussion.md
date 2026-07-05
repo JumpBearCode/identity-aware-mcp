@@ -10,6 +10,13 @@ tags:
 
 # Identity-aware Shell MCP for Azure DataOps Agents
 
+> **Note (2026-06):** This doc describes the original **two-worker** model
+> (`diagnose-worker` / `action-worker` as long-running containers). That is now
+> the **local** path (`EXECUTOR=local`). The cloud path (`EXECUTOR=aca`) replaces
+> the workers with per-Session Azure Container Apps Sandboxes and passwordless
+> Federated Identity Credentials — see [`ACA-Sandbox-迁移方案.md`](./ACA-Redis-Implementation/ACA-Sandbox-迁移方案.md)
+> and the root `README.md`.
+
 核心判断：
 
 > 不要把 Azure CRUD 都包成 MCP tool。

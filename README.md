@@ -1,60 +1,86 @@
-# Identity-aware Azure DataOps MCP (local Docker)
+# Identity-aware Azure DataOps MCP
 
-A minimal reference implementation of the architecture described in `docs/mcp_discussion.md`.
+An identity-aware MCP server for Azure DataOps. The MCP server verifies the
+caller's Entra JWT, checks group membership via OBO, and routes `diagnose_bash`
+(read-only) / `action_bash` (write) to an **execution backend**. Two backends
+sit behind one `Executor` interface (`src/mcp-server/executor.py`):
 
-Three containers:
+| Backend | `EXECUTOR` | Execution substrate | Worker identity |
+|---|---|---|---|
+| **Local** | `local` | two long-running docker workers (shared `bash-worker` image) | fixed SP + client secret |
+| **ACA** | `aca` | per-Session **Azure Container Apps Sandboxes** (microVMs) | passwordless **Federated Identity Credential** → SP |
 
-| Container | Identity | Permissions |
-|---|---|---|
-| `mcp-server` | Entra App (delegated `user_impersonation` scope), client secret for OBO | None on Azure data plane |
-| `diagnose-worker` | `diagnose-sp` Service Principal | Read-only RBAC (Reader) |
-| `action-worker` | `action-sp` Service Principal | Scoped write RBAC |
-
-Both workers run the same `bash-worker` image; they differ only by the injected Service Principal — identity is the boundary, not code.
+The MCP server itself holds **no Azure data-plane permissions** in either path —
+identity is the boundary, not code.
 
 ```
 VS Code / Claude Code
-   │  Entra OAuth (PKCE)
+   │  Entra OAuth (PKCE) + JWT
    ▼
-http://localhost:8080  ── mcp-server (JWT validate + OBO group lookup + route)
-                              ├──► diagnose-worker  (read-only az cli)
-                              └──► action-worker    (write az cli, bounded by SP RBAC; HITL by client)
+mcp-server  ── JWT validate · OBO group check · derive Session/Conversation · route
+   │
+   ├─ EXECUTOR=local ──► diagnose-worker / action-worker  (SP + secret, az cli)
+   │
+   └─ EXECUTOR=aca   ──► SandboxManager
+                           │  Session-sticky route (Redis: oid+session+group)
+                           ▼
+                         ACA Sandbox (microVM)  ── FIC `az login` as worker SP,
+                           per-Session, stateless, Blob-backed workspace
 ```
 
-## Quickstart
+## Two paths, same identity model
+
+* **User identity** (Entra JWT) → authorization, audit, tool visibility.
+* **Worker identity** (per-group SP) → the Azure execution boundary
+  (diagnose = Reader, action = Contributor).
+
+The local path shares one container per group across all users. The ACA path
+isolates execution **per User / per Session**: a Session (30-min sliding TTL)
+sticks to one sandbox per group; the sandbox logs in passwordlessly via a
+Federated Identity Credential, persists files to Blob, and is deleted when the
+Session ends — the next user gets a fresh microVM. See
+[`docs/ACA-Sandbox-迁移方案.md`](docs/ACA-Sandbox-迁移方案.md).
+
+## Quickstart — local docker
 
 ```bash
-# 1. Provision Entra apps, SPs, AD groups (also grants OBO admin consent)
-cd provisioning/python
-uv sync
-uv run python provision.py     # writes ../../.env
+# 1. Provision Entra apps, SPs, AD groups (Bicep, Microsoft.Graph extension)
+cd provisioning/local
+az deployment tenant create -n dataops-mcp-provision -l eastus -f main.bicep
+./write-env.sh dataops-mcp-provision      # writes ../../.env (incl. EXECUTOR=local)
 
-# 2. Add yourself / users to AD groups (see provisioning output for group IDs)
-
-# 3. Grant the worker SPs Azure RBAC (NOT done by provisioning — pick your scope)
+# 2. Add users to the AD groups (ids printed by the deployment)
+# 3. Grant the worker SPs Azure RBAC at the scope you choose (none is assigned yet)
 #    az role assignment create --assignee <DIAGNOSE_SP_CLIENT_ID> --role Reader      --scope <scope>
 #    az role assignment create --assignee <ACTION_SP_CLIENT_ID>   --role Contributor --scope <scope>
 
-# 4. Run local stack
-cd ../..
-docker compose up --build
+# 4. Run the local stack (now includes redis)
+cd ../.. && docker compose up --build
 
-# 5. Wire VS Code (.vscode/mcp.json):
-#    { "servers": { "azure-dataops": { "url": "http://localhost:8080/mcp" } } }
+# 5. Point VS Code at it (.vscode/mcp.json):
+#    { "servers": { "azure-dataops": { "url": "http://localhost:8081/mcp" } } }
 ```
 
-Full step-by-step for the Python route: [`provisioning/python/README.md`](provisioning/python/README.md).
+## Quickstart — ACA sandboxes (cloud)
 
-## Identity model (recap)
+Deploys the full cloud footprint and runs the MCP server as a Container App.
+See [`provisioning/aca/README.md`](provisioning/aca/README.md) for the complete
+step-by-step (image build/push, secret injection, RBAC propagation).
 
-* **User identity** (Entra JWT) → authorization, audit, tool visibility
-* **Worker identity** (fixed SP) → Azure execution boundary
+```bash
+cd provisioning/aca
+az deployment sub create -n dataops-mcp-aca -l westus2 -f main.bicep
+./write-env.sh dataops-mcp-aca            # writes ../../.env.aca
+# then: build/push the MCP + sandbox images to ACR, set the MCP client secret,
+#       point your client at https://<MCP_FQDN>/mcp
+```
 
-The MCP server has **no Azure data-plane permissions**. It only verifies JWTs and routes commands. Workers each carry their own SP credential and run `az cli` inside their container.
+## Layout
 
-## Two provisioning routes
-
-* **`provisioning/python/`** — `msgraph-sdk`. Recommended for first-time setup; easier to debug, prints all IDs/secrets. Worker RBAC is assigned by you afterwards (see its README).
-* **`provisioning/bicep/`** — uses the `Microsoft.Graph` Bicep extension (public preview). Declarative, idempotent. Secret rotation is harder.
-
-Pick one. Both produce the same `.env` consumed by `docker-compose.yml`.
+| Path | What |
+|---|---|
+| `src/mcp-server/` | FastMCP server, `Executor` abstraction, `SandboxManager`, Redis caches, session/blob helpers |
+| `src/worker/` | local docker bash worker (FastAPI), shared by both groups |
+| `src/sandbox-image/` | ACA sandbox disk image + FIC bootstrap |
+| `provisioning/local/` | Entra-only Bicep for the local path |
+| `provisioning/aca/` | full cloud Bicep (sandbox groups, storage, redis, MCP app, RBAC, FIC) |

@@ -11,7 +11,15 @@ import logging
 import os
 
 import httpx
-from cache import GroupCache, InMemoryBackend
+from cache import (
+    GroupCache,
+    InMemoryBackend,
+    RedisBackend,
+    UserSessionCache,
+    make_redis_client,
+)
+from executor import SessionCtx, make_executor
+from session import SessionResolver
 from fastmcp import Context, FastMCP
 from fastmcp.server.auth import AuthContext, RemoteAuthProvider
 from fastmcp.server.auth.providers.azure import AzureJWTVerifier
@@ -29,9 +37,21 @@ MCP_CLIENT_SECRET = os.environ["MCP_CLIENT_SECRET"]
 DIAGNOSE_GROUP_ID = os.environ["DIAGNOSE_GROUP_ID"]
 ACTION_GROUP_ID = os.environ["ACTION_GROUP_ID"]
 BASE_URL = os.environ.get("MCP_SERVER_BASE_URL", "http://localhost:8080")
-DIAGNOSE_WORKER_URL = os.environ.get("DIAGNOSE_WORKER_URL", "http://diagnose-worker:9001")
-ACTION_WORKER_URL = os.environ.get("ACTION_WORKER_URL", "http://action-worker:9002")
-MCP_EXEC_TIMEOUT = float(os.environ.get("MCP_EXEC_TIMEOUT", "120"))
+
+# Execution backend: local docker workers (default) or ACA sandboxes. Both sit
+# behind the same Executor interface; see executor.py / sandbox_manager.py.
+executor = make_executor()
+
+# Session derivation: a Redis-backed 30-min sliding window per user (see
+# session.py). Falls back to transport ids if no Redis is configured.
+SESSION_TTL = int(os.environ.get("MCP_SESSION_TTL", "1800"))
+REDIS_URL = os.environ.get("REDIS_URL")
+_redis = make_redis_client(REDIS_URL) if REDIS_URL else None
+session_resolver = (
+    SessionResolver(UserSessionCache(RedisBackend(_redis, ttl=SESSION_TTL)))
+    if _redis is not None
+    else None
+)
 
 # --- JWT verification: validate Entra access tokens against Entra JWKS ---
 verifier = AzureJWTVerifier(
@@ -110,37 +130,67 @@ require_diagnose = _require_group(DIAGNOSE_GROUP_ID)
 require_action = _require_group(ACTION_GROUP_ID)
 
 
-# --- Middleware: stash user oid for audit ---
+# --- Middleware: stash user oid + Session/Conversation ids for routing & audit -
 class UserAuthMiddleware(Middleware):
+    """Stash the identifiers downstream tools need.
+
+    `user_oid` is the audit identity. `session_id` / `conversation_id` drive the
+    ACA Session-sticky routing and Blob layout; the local backend ignores them.
+
+    Phase 4 swaps `_derive_ids` for the Redis-backed sliding-window logic in
+    `session.py`. For now ids come straight off the FastMCP context so the
+    state keys exist and the wiring is in place.
+    """
+
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         token = get_access_token()
         oid = token.claims.get("oid") if token and hasattr(token, "claims") else None
-        if context.fastmcp_context is not None:
-            await context.fastmcp_context.set_state("user_oid", oid)
+        fctx = context.fastmcp_context
+        if fctx is not None:
+            session_id, conversation_id = await _derive_ids(oid, fctx)
+            await fctx.set_state("user_oid", oid)
+            await fctx.set_state("session_id", session_id)
+            await fctx.set_state("conversation_id", conversation_id)
         logger.info("tool call by user_oid=%s tool=%s", oid, context.message.name)
         return await call_next(context)
+
+
+async def _derive_ids(oid, fctx) -> tuple[str | None, str | None]:
+    """Session/Conversation ids — Redis sliding window when available.
+
+    Never let a Redis hiccup hang or fail a tool call: fall back to transport
+    ids (degraded stickiness) on any error.
+    """
+    transport_sid = getattr(fctx, "session_id", None)
+    request_id = getattr(fctx, "request_id", None)
+    if session_resolver is not None:
+        try:
+            return await session_resolver.resolve(oid, transport_sid, request_id)
+        except Exception as e:
+            logger.warning("session resolve via Redis failed (%s); using transport ids", e)
+    return (transport_sid or oid), request_id
 
 
 mcp = FastMCP("Azure DataOps", auth=auth, middleware=[UserAuthMiddleware()])
 
 
-async def _exec_on_worker(worker_url: str, command: str) -> dict:
-    # httpx waits MCP_EXEC_TIMEOUT; the worker kills the subprocess 10s earlier so
-    # a timeout comes back as a structured result instead of an httpx ReadTimeout.
-    async with httpx.AsyncClient(timeout=MCP_EXEC_TIMEOUT) as client:
-        r = await client.post(
-            f"{worker_url}/exec",
-            json={"command": command, "timeout": MCP_EXEC_TIMEOUT - 10},
-        )
-        r.raise_for_status()
-        return r.json()
+async def _exec(group: str, command: str, ctx: Context):
+    """Build the routing context off stashed state and run on the backend."""
+    sctx = SessionCtx(
+        user_oid=await ctx.get_state("user_oid"),
+        session_id=await ctx.get_state("session_id"),
+        conversation_id=await ctx.get_state("conversation_id"),
+        group=group,  # type: ignore[arg-type]
+    )
+    result = await executor.exec(sctx, command)
+    return result.to_dict()
 
 
 @mcp.tool(
     auth=require_diagnose,
     annotations={"readOnlyHint": True, "openWorldHint": True},
 )
-async def diagnose_bash(command: str) -> dict:
+async def diagnose_bash(command: str, ctx: Context) -> dict:
     """Run a read-only shell command for Azure diagnostics.
 
     The diagnose-worker is a bash shell with the Azure CLI (`az`). Standard shell
@@ -153,7 +203,7 @@ async def diagnose_bash(command: str) -> dict:
     Returns {exit_code, stdout, stderr}.
     """
     logger.info("diagnose_bash: %s", command)
-    return await _exec_on_worker(DIAGNOSE_WORKER_URL, command)
+    return await _exec("diagnose", command, ctx)
 
 
 @mcp.tool(
@@ -191,7 +241,7 @@ async def action_bash(command: str, explanation: str, ctx: Context) -> dict:
         explanation,
         command,
     )
-    return await _exec_on_worker(ACTION_WORKER_URL, command)
+    return await _exec("action", command, ctx)
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -200,3 +250,23 @@ async def health(_request):
 
 
 app = mcp.http_app()
+
+# Ping Redis at startup: a clear connectivity log, and it warms the connection
+# pool on the server's event loop (so the first request never pays first-connect
+# latency or hits a loop-binding surprise). Wraps the FastMCP lifespan.
+if _redis is not None:
+    import contextlib
+
+    _orig_lifespan = app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _lifespan_with_redis_ping(app_):
+        try:
+            pong = await _redis.ping()
+            logger.info("redis startup ping ok: %s", pong)
+        except Exception as e:
+            logger.warning("redis startup ping FAILED: %s", e)
+        async with _orig_lifespan(app_):
+            yield
+
+    app.router.lifespan_context = _lifespan_with_redis_ping

@@ -44,6 +44,7 @@ DIAGNOSE_SP_CLIENT_SECRET=$diag_secret
 ACTION_SP_CLIENT_ID=$act_sp_id
 ACTION_SP_CLIENT_SECRET=$act_secret
 MCP_SERVER_BASE_URL=http://localhost:8080
+EXECUTOR=local
 EOF
 
 echo "Done. Next:"

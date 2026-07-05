@@ -3,3 +3,14 @@ msal>=1.31
 cachetools>=5.3
 httpx>=0.27
 uvicorn[standard]>=0.30
+
+# Redis-backed Session routing / profile / group caches (both paths).
+redis>=5.0
+
+# ACA execution backend (EXECUTOR=aca). Heavy Azure deps; the local path never
+# imports SandboxManager, so these are unused there but harmless to install.
+azure-containerapps-sandbox>=0.1.0b3
+azure-identity>=1.15
+azure-storage-blob>=12.19
+azure-mgmt-resource>=23.0
+azure-mgmt-authorization>=4.0
