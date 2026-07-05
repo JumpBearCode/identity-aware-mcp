@@ -14,7 +14,7 @@ tags:
 > (`diagnose-worker` / `action-worker` as long-running containers). That is now
 > the **local** path (`EXECUTOR=local`). The cloud path (`EXECUTOR=aca`) replaces
 > the workers with per-Session Azure Container Apps Sandboxes and passwordless
-> Federated Identity Credentials — see [`ACA-Sandbox-迁移方案.md`](ACA-Sandbox-迁移方案.md)
+> Federated Identity Credentials — see [`ACA-Sandbox-迁移方案.md`](./ACA-Redis-Implementation/ACA-Sandbox-迁移方案.md)
 > and the root `README.md`.
 
 核心判断：
