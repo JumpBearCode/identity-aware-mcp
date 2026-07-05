@@ -22,8 +22,9 @@
 | **分布式锁 `_dlock`**(跨副本,两层锁内层) | `737e437` | ✅ 已合 | ⚠️ **默认关** | `fix-redis` |
 | **Reaper 值日生选主**(`_try_become_reaper`) | `737e437` | ✅ 已合 | ⚠️ **默认关**(同一开关) | `fix-redis` |
 | 多副本上线(`maxReplicas>1` + 开开关 + 压测) | — | ⏳ **未做(PR-4)** | — | 未来 |
-| PR-2/PR-3 正式单测 | — | ⏳ **未写**(与 e2e 一起) | — | 未来 |
+| PR-2/PR-3 正式单测(mock 单测) | — | ⏳ **未写** | — | 未来 |
 | 测量 harness + PR-1 单测(`tests/`) | `021aaec` | ✅ 保留(供复现) | — | `measure-sandbox-timing` |
+| **端到端冒烟测试**(`tests/e2e_deployed.py`,走真前门) | —(待提交) | ✅ **实测跑通**(2026-07-05,rev `0000007`,详见 §6) | 手动(需登录 + 活部署) | `fix-redis` |
 
 > **一个开关管两件事**:`SANDBOX_DISTRIBUTED_LOCK`(默认 `0`)同时门控 `_dlock` 与 Reaper 选主。关 = 今天的单副本行为逐字节不变;开(将来 `maxReplicas>1` 时,和它同一个 PR)= 跨副本互斥 + 单值日生。timing / create 超时 / 回滚这三样**不受开关控制,已常开**(但 30s 超时远高于实测 ~8s 最坏,平时无感)。
 
@@ -175,11 +176,46 @@ sequenceDiagram
 
 ---
 
-## 6. 分支说明
+## 6. 端到端测试(实测 + 怎么跑)
 
-- **`fix-redis`(主)**:所有功能代码 = 上面矩阵里 `737e437` 那几行(打点 + 锁 + 超时/回滚 + 选主),连同全部设计/落地/实测文档。**不含测试**。
+单测(mock)覆盖不到"真前门"整条链:**Entra 登录 → OBO → MCP streamable-HTTP → `diagnose_bash`/`action_bash` → 真 ACA sandbox**。这条链用 `src/mcp-server/tests/e2e_deployed.py` 手动跑(要交互登录 + 活部署,所以不进 CI)。
+
+**怎么跑**
+
+```
+pip install mcp msal                      # 客户端 SDK,不在服务器镜像里
+python src/mcp-server/tests/e2e_deployed.py
+# 首次打印设备码 URL:浏览器打开、输码、用 diagnose+action 组成员登录。
+# token 缓存到 ~/.cache/aca-mcp-e2e/,之后复跑静默,直到过期。
+```
+
+默认打当前 dev 部署;可用环境变量 `MCP_SERVER_URL` / `AZURE_TENANT_ID` / `MCP_APP_ID` / `MCP_DEVICE_CLIENT_ID` 覆盖。
+
+**断言了什么(5 条,对应脚本里的 5 个 check):**
+
+| # | 断言 | 证明 |
+|---|---|---|
+| 1 | 两把工具都出现在 `tools/list` | auth + OBO + 组成员解析 OK |
+| 2 | `diagnose_bash` 首调 `exit=0` | 冷建 sandbox + bootstrap 成功 |
+| 3 | sandbox 内 `az account show` `exit=0` | FIC 免密 `az login` bootstrap 生效 |
+| 4 | 第 1 调写的 marker 文件第 3 调能读到 | 同一 sandbox 复用 = session 粘连路由(hit 路径) |
+| 5 | `action_bash` `exit=0` | 第二个组 / 第二台 sandbox 也通 |
+
+**本次实测(2026-07-05,rev `0000007`,当次特意开着 `SANDBOX_DISTRIBUTED_LOCK=1` 实跑锁路径):**
+- 工具两把都出来;三条 `diagnose_bash`(`whoami` / `echo+date` / `az account show`)+ 复用命中,全部按预期。
+- 服务器日志时延与实测报告吻合:`create total=4.549s`(disk 2.97 / vol 0.12 / vm 1.39 / autodel 0.06)、`bootstrap exec=2.94s`(`account=d09dfd39…`,即 FIC 登录成功)、`hit ensure_running≈0.02s`。
+- **关键:flag 开实跑,全程无 `dlock acquire/release failed` 告警** → 真 redis-py `Lock` 在真 Redis(client `decode_responses=True`)上 acquire+release 干净通过,之前担心的 decode 兼容问题不存在。
+- 测完把 flag 改回 `0`(默认关,见 §0 矩阵),现活动 rev `0000008`,镜像 `mcp-server:distlock`(= `737e437` 功能代码)。
+
+**本次没覆盖(留后续):** Reaper 选主那一轮 —— `_reaper_loop` 先 `sleep(reaper_interval=300s)` 才首次选主、且成功路径静默,单副本下等于走"每副本各扫"。它用的是 sessions/index 一直在用的同一个 Redis client,风险低;正式确认放到多副本压测(§0 的 PR-4)时一起做。
+
+---
+
+## 7. 分支说明
+
+- **`fix-redis`(主)**:所有功能代码 = 上面矩阵里 `737e437` 那几行(打点 + 锁 + 超时/回滚 + 选主),连同全部设计/落地/实测文档,**外加端到端冒烟测试** `tests/e2e_deployed.py`(见 §6;PR-2/PR-3 的 mock 单测仍待补)。
 - **`measure-sandbox-timing`**:只留"测量结论" = PR-1 打点(`021aaec`)+ 测量 harness `measure_create_timeline.py` + 单测 `test_timing_instrumentation.py`。这些测试连同 PR-2/PR-3 的正式单测,**日后与端到端(e2e)测试一起补**。
-- **未来(PR-4)**:`provisioning/aca/modules/mcp-app.bicep` 把 `maxReplicas` 调 >1、同 PR 置 `SANDBOX_DISTRIBUTED_LOCK=1`,跑多副本压测(§7 清单),把 create 尾延迟在并发下复测定稿。
+- **未来(PR-4)**:`provisioning/aca/modules/mcp-app.bicep` 把 `maxReplicas` 调 >1、同 PR 置 `SANDBOX_DISTRIBUTED_LOCK=1`,跑多副本压测(见[落地方案](MCP-分布式锁与Reaper选主-实现方案.md)的 §7 压测清单),把 create 尾延迟在并发下复测定稿。
 
 ---
 
