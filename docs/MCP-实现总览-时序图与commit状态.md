@@ -1,0 +1,186 @@
+# MCP 实现总览:Sandbox 创建 · Redis · Reaper(时序图 + commit 状态)
+
+这份是**收口文档**:把 sandbox 创建、Redis 用法、Reaper 回收的**最终实现**用时序图画清楚,并给每一块标上**实现它的 commit hash 和状态**,方便日后回看"哪行代码是哪个 commit 来的、上没上、开没开"。
+
+配套:[MCP-分布式锁与Reaper选主-实现方案.md](MCP-分布式锁与Reaper选主-实现方案.md)(落地方案)、[MCP-Sandbox-创建耗时实测报告.md](MCP-Sandbox-创建耗时实测报告.md)(实测)、[MCP-水平扩展-分布式锁与Reaper选主.md](MCP-水平扩展-分布式锁与Reaper选主.md)(原理)。
+
+代码:`src/mcp-server/sandbox_manager.py`、`cache.py`、`session.py`、`main.py`。
+
+---
+
+## 0. 状态一览(commit hash 矩阵)
+
+| 组件 / 特性 | 实现 commit | 状态 | 默认行为 | 分支 |
+|---|---|---|---|---|
+| SandboxManager 核心(`get_or_create` / `_create_sandbox` / `_bootstrap`) | `c968a9d`(Phase 3) | ✅ 上线 | 常开 | 主线 |
+| Blob volume 挂载(`_workspace_volumes`) | `1f4368a`(Phase 5) | ✅ 上线 | 常开 | 主线 |
+| Redis 正向路由 + profile + `bootstrapped` 标记 | `32d06bd`(Phase 4) | ✅ 上线 | 常开 | 主线 |
+| 专用 Redis Container App(env 内短名互通) | `3465dee` | ✅ 上线 | 常开 | 主线 |
+| 反向索引 `mcp:sbxidx` + Reaper(每副本各扫) | `59bb16f`(Phase 6) | ✅ 上线 | 常开 | 主线 |
+| **timing 打点**(`_log_timing`,create/bootstrap/hit) | `737e437` | ✅ 已合 | 常开(纯日志) | `fix-redis` |
+| **create 超时**(`wait_for`)+ **失败回滚** session key | `737e437` | ✅ 已合 | 常开(仅异常路径显现) | `fix-redis` |
+| **分布式锁 `_dlock`**(跨副本,两层锁内层) | `737e437` | ✅ 已合 | ⚠️ **默认关** | `fix-redis` |
+| **Reaper 值日生选主**(`_try_become_reaper`) | `737e437` | ✅ 已合 | ⚠️ **默认关**(同一开关) | `fix-redis` |
+| 多副本上线(`maxReplicas>1` + 开开关 + 压测) | — | ⏳ **未做(PR-4)** | — | 未来 |
+| PR-2/PR-3 正式单测 | — | ⏳ **未写**(与 e2e 一起) | — | 未来 |
+| 测量 harness + PR-1 单测(`tests/`) | `021aaec` | ✅ 保留(供复现) | — | `measure-sandbox-timing` |
+
+> **一个开关管两件事**:`SANDBOX_DISTRIBUTED_LOCK`(默认 `0`)同时门控 `_dlock` 与 Reaper 选主。关 = 今天的单副本行为逐字节不变;开(将来 `maxReplicas>1` 时,和它同一个 PR)= 跨副本互斥 + 单值日生。timing / create 超时 / 回滚这三样**不受开关控制,已常开**(但 30s 超时远高于实测 ~8s 最坏,平时无感)。
+
+---
+
+## 1. 组件全景
+
+```mermaid
+flowchart LR
+    Tool["diagnose_bash / action_bash<br/>(main.py)"] --> Mgr["SandboxManager.get_or_create<br/>c968a9d + 737e437"]
+    Mgr -->|"① 本地锁"| L["asyncio.Lock<br/>(同副本, 免费)"]
+    Mgr -->|"② 跨副本锁 (flag)"| DL["_dlock → Redis Lock<br/>737e437"]
+    Mgr -->|"路由/索引/profile"| R[("Redis<br/>3465dee 专用实例")]
+    Mgr -->|"建/开机/删"| ARM[["ACA Sandbox API<br/>(ARM)"]]
+    Reaper["Reaper loop (值日生)<br/>59bb16f + 737e437"] --> R
+    Reaper --> ARM
+```
+
+---
+
+## 2. 时序图 A:Sandbox 创建 / 复用(`get_or_create`)
+
+最终实现(`c968a9d` 核心 + `737e437` 加两层锁/超时/回滚)。**flag 关时,`_dlock` 那一步是空操作。**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Tool as Tool call
+    participant Mgr as SandboxManager
+    participant L as asyncio.Lock
+    participant DL as _dlock (Redis, flag)
+    participant R as Redis
+    participant ARM as ACA Sandbox API
+
+    Tool->>Mgr: get_or_create(ctx)
+    Mgr->>L: async with _lock(key)  (同副本串行, 免费)
+    Mgr->>DL: async with _dlock(key)
+    Note over DL,R: flag 关→直接放行,flag 开→SET lock:key token NX PX 60s
+
+    Mgr->>R: sessions.get(key)   正向, 命中则滑动 TTL
+    alt 命中 (hit) — 绝大多数调用
+        R-->>Mgr: sandbox_id
+        Mgr->>ARM: ensure_running()
+        Mgr-->>Tool: client  (复用, log timing phase=hit ~0.08s)
+    else 未命中 (miss) — 每个 session 首次
+        R-->>Mgr: nil
+        Mgr->>ARM: wait_for(_create_sandbox, create_timeout=30s)
+        Note over Mgr,ARM: A 解析镜像 · B volume · C 建 microVM · D 设 auto-delete
+        ARM-->>Mgr: client (新 sandbox_id)
+        Mgr->>R: sessions.set(key → id)     正向
+        Mgr->>R: index.set(id → meta)       反向 (给 Reaper)
+        Mgr->>ARM: _bootstrap: exec bootstrap.sh  (E: FIC az login)
+        alt bootstrap / 写库 失败
+            Mgr->>R: sessions.delete(key)   回滚正向 (保留反向索引→Reaper 收)
+            Mgr-->>Tool: raise
+        else 成功
+            Mgr->>R: mark_bootstrapped(id)
+            Mgr-->>Tool: client
+        end
+    end
+    Note over DL: 退出 _dlock: EVAL 校验 token 匹配才 DEL (防误删)
+```
+
+**关键点(都在 `737e437`):**
+- **两层锁**:外层 `asyncio.Lock` 挡同副本(免费),内层 `_dlock` 挡跨副本(best-effort,Redis 挂了/等锁超时都降级放行,绝不 fail 请求)。
+- **create 超时**:`wait_for(_create_sandbox, 30s)` —— 卡死的建不会永占锁。⚠️ 只取消"我这边等待",ARM 那台可能仍建成 → 孤儿由 Reaper 收。
+- **失败回滚**:bootstrap/写库抛错时删掉正向 key(保留反向索引),下次同 key 重建,不会复用"没登录的坏台子"。
+- **顺序不能变**:正向 `sessions.set` 在 `_bootstrap` **之前**,以保证 Reaper 在 bootstrap 期间看到 `live==sbx`、不误删(所以没做无锁快路径)。
+
+---
+
+## 3. 时序图 B:分布式锁跨副本(`_dlock`,flag 开时)
+
+同一 routing key 的两个并发请求落到不同副本,**只建一台**(对照:flag 关时会各建一台→孤儿,由 Reaper 兜)。实现:`737e437`。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Replica A
+    participant R as Redis
+    participant B as Replica B
+    Note over A,B: 同一 routing key 并发, SANDBOX_DISTRIBUTED_LOCK=1
+
+    A->>R: SET lock:key tokenA NX PX 60000
+    R-->>A: OK (拿到锁)
+    B->>R: SET lock:key tokenB NX PX 60000
+    R-->>B: nil → 阻塞重试 (blocking_timeout=45s)
+    A->>A: 建 sandbox + bootstrap (实测 ~4–8s)
+    A->>R: sessions.set(key → sbx-1)
+    A->>R: EVAL 释放锁 (token 匹配才 DEL)
+    B->>R: 重试 SET lock:key → OK
+    B->>R: sessions.get(key) → sbx-1
+    B-->>B: 命中复用 sbx-1 (不再建)
+    Note over A,B: 全程只建一台, 无孤儿
+```
+
+> 降级:`_dlock` 抢锁抛异常(Redis 不可达)或等锁超 45s → 记 warning 后**照常放行**,退回"仅 asyncio.Lock",最坏偶发一台孤儿(Reaper 收)。它是**效率锁不是正确性锁**;用户隔离的 1:1 绑定由 `never-rebind` 独立守住,与这把锁无关。
+
+---
+
+## 4. 时序图 C:Reaper 值日生选主(`_reaper_loop`)
+
+flag 开时每轮选 1 个 leader 干活;flag 关时退回"每副本各扫"(幂等,只是浪费)。核心 `reap_orphans` 自 `59bb16f`,选主 `737e437`。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Reaper @ Replica A
+    participant B as Reaper @ Replica B
+    participant R as Redis
+    participant ARM as ACA Sandbox API
+    loop 每 reaper_interval (300s)
+        A->>R: SET mcp:reaper:leader tokenA NX EX 90
+        R-->>A: OK (当选 leader)
+        B->>R: SET mcp:reaper:leader tokenB NX EX 90
+        R-->>B: nil → 本轮跳过 (continue)
+        A->>ARM: list_sandboxes()  (diagnose + action)
+        loop 每个 sandbox
+            A->>R: index.get(sbx.id)         反向 → meta
+            A->>R: sessions.peek(meta)        正向, 非滑动
+            alt session 已消失 → 孤儿
+                A->>ARM: begin_delete_sandbox(sbx.id)
+                A->>R: index.delete(sbx.id)
+            else 仍被活 session 持有
+                Note over A: 保留
+            end
+        end
+        A->>R: EVAL 交班 (token 匹配才 DEL mcp:reaper:leader)
+    end
+```
+
+**三道回收网(纵深防御):** ① 本节 Reaper(session 一结束就删,~5min)→ ② 平台 `auto_suspend`(5min 挂起停计费)→ ③ 平台 `auto_delete`(1h 最终兜底)。孤儿正常 ~5min 被收,不是熬满 1h。
+
+---
+
+## 5. Redis 数据模型(key / TTL / commit)
+
+前缀:`sessions`/`profiles` 用 `RedisBackend(prefix="mcp")`;反向索引单独 `prefix="mcp:sbxidx"`;`_dlock` 和选主用**裸 client**(键名如实写)。
+
+| Redis key(含前缀) | 内容 | TTL | 写 | 读 | commit |
+|---|---|---|---|---|---|
+| `mcp:session:{oid}:{session}:{group}` | **正向**:routing key → sandbox_id | 1800s 滑动 | `get_or_create` | `get`(命中)/ `peek`(Reaper) | `32d06bd` |
+| `mcp:sbxidx:{sandbox_id}` | **反向**:sandbox_id → {oid,session,group} | 永不过期 | `get_or_create` | Reaper | `59bb16f` |
+| `mcp:bootstrapped:{sandbox_id}` | 已 `az login` 标记 | 永不过期 | `get_or_create` | `get_or_create` | `32d06bd` |
+| `mcp:profile:{oid}` | 用户 subscription 等,重建 `az` 上下文 | 永不过期 | 登录时 | `_user_subscription` | `32d06bd` |
+| `mcp:usersession:{oid}` | oid → session_id(30min 窗口派生) | 1800s 滑动 | middleware(`session.py`) | middleware | `32d06bd` |
+| `lock:{oid}:{session}:{group}` | **分布式锁** token | `lock_ttl`=60s | `_dlock`(flag) | `_dlock` | `737e437` |
+| `mcp:reaper:leader` | **值日生** token | `ex=reaper_lease`=90s | `_try_become_reaper`(flag) | 同 | `737e437` |
+
+---
+
+## 6. 分支说明
+
+- **`fix-redis`(主)**:所有功能代码 = 上面矩阵里 `737e437` 那几行(打点 + 锁 + 超时/回滚 + 选主),连同全部设计/落地/实测文档。**不含测试**。
+- **`measure-sandbox-timing`**:只留"测量结论" = PR-1 打点(`021aaec`)+ 测量 harness `measure_create_timeline.py` + 单测 `test_timing_instrumentation.py`。这些测试连同 PR-2/PR-3 的正式单测,**日后与端到端(e2e)测试一起补**。
+- **未来(PR-4)**:`provisioning/aca/modules/mcp-app.bicep` 把 `maxReplicas` 调 >1、同 PR 置 `SANDBOX_DISTRIBUTED_LOCK=1`,跑多副本压测(§7 清单),把 create 尾延迟在并发下复测定稿。
+
+---
+
+*关联:* [MCP-分布式锁与Reaper选主-实现方案.md](MCP-分布式锁与Reaper选主-实现方案.md) · [MCP-Sandbox-创建耗时实测报告.md](MCP-Sandbox-创建耗时实测报告.md) · [MCP-水平扩展-分布式锁与Reaper选主.md](MCP-水平扩展-分布式锁与Reaper选主.md) · [ACA-Sandbox-迁移方案.md](ACA-Sandbox-迁移方案.md)
