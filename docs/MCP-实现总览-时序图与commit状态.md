@@ -24,7 +24,7 @@
 | 多副本上线(`maxReplicas>1` + 开开关 + 压测) | — | ⏳ **未做(PR-4)** | — | 未来 |
 | PR-2/PR-3 正式单测(mock 单测) | — | ⏳ **未写** | — | 未来 |
 | 测量 harness + PR-1 单测(`tests/`) | `021aaec` | ✅ 保留(供复现) | — | `measure-sandbox-timing` |
-| **端到端冒烟测试**(`tests/e2e_deployed.py`,走真前门) | —(待提交) | ✅ **实测跑通**(2026-07-05,rev `0000007`,详见 §6) | 手动(需登录 + 活部署) | `fix-redis` |
+| **端到端冒烟测试**(`tests/e2e_deployed.py`,走真前门) | —(待提交) | ✅ **实测跑通**(2026-07-05,rev `0000007`,详见 §7) | 手动(需登录 + 活部署) | `fix-redis` |
 
 > **一个开关管两件事**:`SANDBOX_DISTRIBUTED_LOCK`(默认 `0`)同时门控 `_dlock` 与 Reaper 选主。关 = 今天的单副本行为逐字节不变;开(将来 `maxReplicas>1` 时,和它同一个 PR)= 跨副本互斥 + 单值日生。timing / create 超时 / 回滚这三样**不受开关控制,已常开**(但 30s 超时远高于实测 ~8s 最坏,平时无感)。
 
@@ -176,7 +176,45 @@ sequenceDiagram
 
 ---
 
-## 6. 端到端测试(实测 + 怎么跑)
+## 6. 时间参数与实测耗时一览
+
+把散落在 §2–§5 的各种"时间"收在一处:**6.1 是配置的旋钮**(超时 / TTL / 周期,都有 env 可调),**6.2 是实测耗时**(实际跑多久)。一句话:冷启动 ~7–8s 一次性,之后命中 ~0.02s;所有超时都对实测留了 ≥3× 余量。
+
+### 6.1 定时器 / 超时 / TTL(配置项)
+
+| 参数 | 值(默认) | env / 字段 | 归属 | 作用 | 见 |
+|---|---|---|---|---|---|
+| create 超时 | 30s | `SANDBOX_CREATE_TIMEOUT` / `create_timeout` | `get_or_create` | `wait_for` 建台子超时即放弃(远高于实测最坏 ~8s) | §2 |
+| 分布式锁 TTL | 60s | `SANDBOX_LOCK_TTL` / `lock_ttl` | `_dlock`(`lock:*`) | 锁自动过期(SET PX),持锁副本崩了也不死锁;关键段实测 ~8s ≪ 60s | §2 §3 §5 |
+| 等锁超时 | 45s | `SANDBOX_LOCK_WAIT` / `lock_wait` | `_dlock` | `blocking_timeout`,等不到就降级放行(绝不 fail 请求) | §3 |
+| session TTL(正向路由) | 1800s(30min)滑动 | `cache.py` / `session.py` | `mcp:session:*` | 每次命中滑动续期;静默满 30min = "session 结束" | §5 |
+| usersession 窗口 | 1800s(30min)滑动 | `session.py` | `mcp:usersession:*` | oid→session_id 的 30min 派生窗口 | §5 |
+| 反向索引 / bootstrapped / profile | 永不过期 | — | `mcp:sbxidx:*` 等 | 靠 Reaper / 显式删,不靠 TTL | §5 |
+| Reaper 选主租约 | 90s | `SANDBOX_REAPER_LEASE` / `reaper_lease` | `mcp:reaper:leader` | leader 令牌 EX;≈ 一轮工作上限,到期自动换届 | §4 §5 |
+| Reaper 扫描周期 | 300s(5min) | `SANDBOX_REAPER_INTERVAL` / `reaper_interval` | `_reaper_loop` | 每轮先 `sleep(300s)` 再选主+扫(首轮也先睡) | §4 |
+| 平台 auto_suspend | 5min | ACA 参数 | sandbox | 空闲挂起、停计费(回收第 2 道网) | §4 |
+| 平台 auto_delete | 1h | ACA 参数 | sandbox | 最终兜底删除(回收第 3 道网) | §4 |
+
+> 三个超时是**递进**的:建台子最坏 ~8s < **等锁 45s**(足够让先到的副本建完)< **锁 TTL 60s**(比等锁长,正常路径不会等锁把锁等到过期)。全部 `SANDBOX_*` 环境变量可调,不改代码。
+
+### 6.2 实测耗时(2026-07-05,单机 rev `0000007`;分布详见[实测报告](MCP-Sandbox-创建耗时实测报告.md))
+
+| 阶段 | 实测 | 说明 |
+|---|---|---|
+| **create 总**(miss 建台子) | ~4.5s(报告:中位 ~4s / 最坏 ~8.3s) | 下面 A–D 之和 |
+| ├ A 解析镜像 `disk` | ~2.97s | 最大头 |
+| ├ B `volume` 挂载 | ~0.12s | |
+| ├ C 建 microVM `vm` | ~1.39s | |
+| └ D 设 `auto-delete` | ~0.06s | |
+| **bootstrap**(E:FIC `az login`) | ~2.9s | exec `bootstrap.sh` |
+| **冷启动合计**(create + bootstrap) | ~7–8s(最坏) | 每个 session 仅首次 |
+| **hit**(复用,`ensure_running`) | ~0.02–0.08s | 绝大多数调用走这条 |
+
+> 读法:一个 session 只在**首次**吃 ~7–8s 冷启动,之后每次调用都是 ~0.02s 命中。所以 30s 的 create 超时平时根本碰不到。
+
+---
+
+## 7. 端到端测试(实测 + 怎么跑)
 
 单测(mock)覆盖不到"真前门"整条链:**Entra 登录 → OBO → MCP streamable-HTTP → `diagnose_bash`/`action_bash` → 真 ACA sandbox**。这条链用 `src/mcp-server/tests/e2e_deployed.py` 手动跑(要交互登录 + 活部署,所以不进 CI)。
 
@@ -211,9 +249,9 @@ python src/mcp-server/tests/e2e_deployed.py
 
 ---
 
-## 7. 分支说明
+## 8. 分支说明
 
-- **`fix-redis`(主)**:所有功能代码 = 上面矩阵里 `737e437` 那几行(打点 + 锁 + 超时/回滚 + 选主),连同全部设计/落地/实测文档,**外加端到端冒烟测试** `tests/e2e_deployed.py`(见 §6;PR-2/PR-3 的 mock 单测仍待补)。
+- **`fix-redis`(主)**:所有功能代码 = 上面矩阵里 `737e437` 那几行(打点 + 锁 + 超时/回滚 + 选主),连同全部设计/落地/实测文档,**外加端到端冒烟测试** `tests/e2e_deployed.py`(见 §7;PR-2/PR-3 的 mock 单测仍待补)。
 - **`measure-sandbox-timing`**:只留"测量结论" = PR-1 打点(`021aaec`)+ 测量 harness `measure_create_timeline.py` + 单测 `test_timing_instrumentation.py`。这些测试连同 PR-2/PR-3 的正式单测,**日后与端到端(e2e)测试一起补**。
 - **未来(PR-4)**:`provisioning/aca/modules/mcp-app.bicep` 把 `maxReplicas` 调 >1、同 PR 置 `SANDBOX_DISTRIBUTED_LOCK=1`,跑多副本压测(见[落地方案](MCP-分布式锁与Reaper选主-实现方案.md)的 §7 压测清单),把 create 尾延迟在并发下复测定稿。
 
