@@ -19,9 +19,12 @@ those sandboxes' whole lifecycle. Five jobs (see §3.4 of the migration doc):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shlex
+import time
+import uuid
 
 from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
 
@@ -35,6 +38,14 @@ from cache import (
 from executor import ExecResult, Group, SessionCtx
 
 logger = logging.getLogger("dataops-mcp.sandbox")
+
+# Redis Lua: delete a lock/lease key only if we still own it (value == our
+# token), so we never release a lock that already expired and was retaken.
+_RELEASE_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+_NO_LEASE = ""  # sentinel: reap this round without holding a Redis lease
 
 MAX_OUTPUT_BYTES = int(os.environ.get("MAX_OUTPUT_BYTES", str(64 * 1024)))
 TRUNCATE_HINT = (
@@ -87,6 +98,11 @@ class SandboxManager:
         index=None,
         reaper_interval: int = 300,
         redis_client=None,
+        distributed_lock: bool = False,
+        lock_ttl: int = 60,
+        lock_wait: float = 45.0,
+        create_timeout: float = 30.0,
+        reaper_lease: int = 90,
     ):
         self._cred = credential
         self._subscription_id = subscription_id
@@ -110,6 +126,14 @@ class SandboxManager:
         self._index = index
         self._reaper_interval = reaper_interval
         self._redis = redis_client
+        # Horizontal-scaling coordination (impl plan §4.1). Off by default =
+        # today's single-replica behaviour (asyncio.Lock only). Turn on together
+        # with maxReplicas>1. Timeouts are measured-calibrated (report §7).
+        self._dlock_enabled = distributed_lock
+        self._lock_ttl = lock_ttl
+        self._lock_wait = lock_wait
+        self._create_timeout = create_timeout
+        self._reaper_lease = reaper_lease
 
         self._group_clients: dict[Group, object] = {}
         self._built_disk_ids: dict[str, str] = {}
@@ -162,6 +186,11 @@ class SandboxManager:
             index=index,
             reaper_interval=int(os.environ.get("SANDBOX_REAPER_INTERVAL", "300")),
             redis_client=redis_client,
+            distributed_lock=os.environ.get("SANDBOX_DISTRIBUTED_LOCK", "0") == "1",
+            lock_ttl=int(os.environ.get("SANDBOX_LOCK_TTL", "60")),
+            lock_wait=float(os.environ.get("SANDBOX_LOCK_WAIT", "45")),
+            create_timeout=float(os.environ.get("SANDBOX_CREATE_TIMEOUT", "30")),
+            reaper_lease=int(os.environ.get("SANDBOX_REAPER_LEASE", "90")),
         )
 
     def _group_client(self, group: Group):
@@ -187,22 +216,85 @@ class SandboxManager:
             self._locks[key] = lock
         return lock
 
+    @contextlib.asynccontextmanager
+    async def _dlock(self, key: str):
+        """Cross-replica lock, layered UNDER the local asyncio.Lock (impl plan §4.2).
+
+        Best-effort: if disabled, Redis-less, or the lock can't be taken in time,
+        log and proceed WITHOUT it — the local lock still serialises same-replica
+        concurrency, and the reaper + never-rebind bound a rare double-create.
+        This is an efficiency lock, not a correctness lock (design §4.8); it must
+        never fail or hang a tool call.
+        """
+        if not self._dlock_enabled or self._redis is None:
+            yield
+            return
+        lock = self._redis.lock(
+            f"lock:{key}",
+            timeout=self._lock_ttl,              # lock TTL (auto-expire => no deadlock)
+            blocking=True,
+            blocking_timeout=self._lock_wait,    # how long a waiter blocks
+        )
+        got = False
+        try:
+            got = await lock.acquire()
+            if not got:
+                logger.warning(
+                    "dlock: %s not acquired in %.0fs; proceeding degraded",
+                    key, self._lock_wait,
+                )
+        except Exception as e:                   # Redis unreachable, etc.
+            logger.warning("dlock acquire failed (%s); local lock only", e)
+        try:
+            yield
+        finally:
+            if got:
+                try:
+                    await lock.release()         # redis-py verifies our token via Lua
+                except Exception as e:           # LockNotOwnedError: TTL lapsed
+                    logger.warning("dlock release failed (%s)", e)
+
+    @staticmethod
+    def _log_timing(phase: str, sandbox_id: str, group: Group, **segments: float) -> None:
+        """Emit one structured timing line per lifecycle phase.
+
+        Feeds the create-timeline measurement (docs/MCP-分布式锁与Reaper选主-实现
+        方案.md §5): read these off the cloud logs to calibrate create_timeout /
+        lock TTL before turning on the distributed lock. Pure observability — no
+        behavioural effect. `extra["timing"]` carries the same numbers as a dict
+        so a harness can capture them without parsing the message.
+
+            az containerapp logs show -n dataops-aca-mcp -g dataops-aca-rg \
+              --follow false --tail 500 | grep 'timing phase'
+        """
+        parts = " ".join(f"{k}={v:.3f}" for k, v in segments.items())
+        logger.info(
+            "timing phase=%s sbx=%s group=%s %s", phase, sandbox_id, group, parts,
+            extra={"timing": {"phase": phase, "sandbox": sandbox_id, "group": group, **segments}},
+        )
+
     # -------------------------------------------------------------- routing
     async def get_or_create(self, ctx: SessionCtx):
         """Return a running, bootstrapped SandboxClient for this routing key."""
         group = ctx.group
         gclient = self._group_client(group)
+        key = f"{ctx.user_oid}:{ctx.session_id}:{group}"
 
         # Serialize create-or-reuse per routing key so two concurrent calls in
-        # the same Session don't each spin up a sandbox.
-        async with self._lock(f"{ctx.user_oid}:{ctx.session_id}:{group}"):
+        # the same Session don't each spin up a sandbox. Two layers (impl plan
+        # §4.3): the local asyncio.Lock covers same-replica concurrency (free);
+        # the best-effort Redis _dlock covers cross-replica (no-op until the
+        # SANDBOX_DISTRIBUTED_LOCK flag is on).
+        async with self._lock(key), self._dlock(key):
             sandbox_id = await self._redis_safe(
                 self._sessions.get(ctx.user_oid, ctx.session_id, group), default=None
             )
             if sandbox_id is not None:
                 client = gclient.get_sandbox_client(sandbox_id)
                 try:
+                    t0 = time.monotonic()
                     await client.ensure_running()
+                    self._log_timing("hit", sandbox_id, group, ensure_running=time.monotonic() - t0)
                     logger.info("session hit: reuse sandbox %s (%s)", sandbox_id, group)
                     return client
                 except ResourceNotFoundError:
@@ -211,22 +303,39 @@ class SandboxManager:
                         self._sessions.delete(ctx.user_oid, ctx.session_id, group)
                     )
 
-            client = await self._create_sandbox(ctx, gclient, group)
-            await self._redis_safe(
-                self._sessions.set(ctx.user_oid, ctx.session_id, group, client.sandbox_id)
+            # Cap one create attempt so a stuck ARM call can't hold the lock
+            # forever (impl plan §4.3). wait_for cancels OUR wait, not ARM — a
+            # sandbox that finishes building later becomes an orphan the reaper
+            # reclaims.
+            client = await asyncio.wait_for(
+                self._create_sandbox(ctx, gclient, group),
+                timeout=self._create_timeout,
             )
-            if self._index is not None:
-                await self._redis_safe(self._index.set(
-                    client.sandbox_id,
-                    {"oid": ctx.user_oid, "session": ctx.session_id, "group": group},
-                ))
-            already = await self._redis_safe(
-                self._sessions.is_bootstrapped(client.sandbox_id), default=False
-            )
-            if not already:
-                await self._bootstrap(client, ctx, group)
-                await self._redis_safe(self._sessions.mark_bootstrapped(client.sandbox_id))
-            return client
+            try:
+                await self._redis_safe(
+                    self._sessions.set(ctx.user_oid, ctx.session_id, group, client.sandbox_id)
+                )
+                if self._index is not None:
+                    await self._redis_safe(self._index.set(
+                        client.sandbox_id,
+                        {"oid": ctx.user_oid, "session": ctx.session_id, "group": group},
+                    ))
+                already = await self._redis_safe(
+                    self._sessions.is_bootstrapped(client.sandbox_id), default=False
+                )
+                if not already:
+                    await self._bootstrap(client, ctx, group)
+                    await self._redis_safe(self._sessions.mark_bootstrapped(client.sandbox_id))
+                return client
+            except Exception:
+                # Bootstrap/setup failed: roll back the routing key so the next
+                # call recreates instead of reusing an un-bootstrapped sandbox.
+                # Keep the reverse index so the reaper reclaims the ARM resource
+                # (impl plan §5.3/§8).
+                await self._redis_safe(
+                    self._sessions.delete(ctx.user_oid, ctx.session_id, group)
+                )
+                raise
 
     @staticmethod
     async def _redis_safe(coro, *, default=None):
@@ -242,7 +351,9 @@ class SandboxManager:
             return default
 
     async def _create_sandbox(self, ctx: SessionCtx, gclient, group: Group):
-        disk_kwargs = await self._resolve_disk(gclient, group)
+        t0 = time.monotonic()
+        disk_kwargs = await self._resolve_disk(gclient, group)   # A: disk/image resolve
+        t_disk = time.monotonic() - t0
         labels = {
             "user": _label_safe(ctx.user_oid),
             "session": _label_safe(ctx.session_id),
@@ -253,9 +364,12 @@ class SandboxManager:
             "AZURE_TENANT_ID": self._tenant_id,
             "AZURE_SUBSCRIPTION_ID": await self._user_subscription(ctx.user_oid),
         }
-        volumes = await self._workspace_volumes(gclient, group)
+        t1 = time.monotonic()
+        volumes = await self._workspace_volumes(gclient, group)  # B: ensure volume
+        t_vol = time.monotonic() - t1
         logger.info("session miss: creating %s sandbox (%s)", group, disk_kwargs)
-        poller = await gclient.begin_create_sandbox(
+        t2 = time.monotonic()
+        poller = await gclient.begin_create_sandbox(             # C: provision microVM
             labels=labels,
             environment=environment,
             cpu=self._cpu,
@@ -265,7 +379,15 @@ class SandboxManager:
             **disk_kwargs,
         )
         client = await poller.result()
-        await self._apply_idle_autodelete(client)
+        t_vm = time.monotonic() - t2
+        t3 = time.monotonic()
+        await self._apply_idle_autodelete(client)               # D: set auto-delete
+        t_autodel = time.monotonic() - t3
+        self._log_timing(
+            "create", client.sandbox_id, group,
+            disk=t_disk, vol=t_vol, vm=t_vm, autodel=t_autodel,
+            total=t_disk + t_vol + t_vm + t_autodel,
+        )
         return client
 
     async def _workspace_volumes(self, gclient, group: Group):
@@ -358,7 +480,9 @@ class SandboxManager:
     async def _bootstrap(self, client, ctx: SessionCtx, group: Group) -> None:
         """Passwordless FIC login as the worker SP, then restore user context."""
         logger.info("bootstrapping sandbox %s (%s)", client.sandbox_id, group)
-        result = await client.exec("bash /opt/bootstrap.sh")
+        t0 = time.monotonic()
+        result = await client.exec("bash /opt/bootstrap.sh")    # E: FIC az login + profile
+        dt = time.monotonic() - t0
         if result.exit_code != 0:
             logger.error(
                 "bootstrap failed on %s: rc=%s stderr=%s",
@@ -366,6 +490,7 @@ class SandboxManager:
             )
             raise RuntimeError(f"sandbox bootstrap failed (rc={result.exit_code})")
         logger.info("bootstrap ok on %s: %s", client.sandbox_id, result.stdout.strip()[:200])
+        self._log_timing("bootstrap", client.sandbox_id, group, exec=dt)
 
     async def _user_subscription(self, oid: str | None) -> str:
         if oid is not None:
@@ -433,9 +558,42 @@ class SandboxManager:
         while True:
             await asyncio.sleep(self._reaper_interval)
             try:
-                await self.reap_orphans()
+                token = await self._try_become_reaper()   # leader election (impl plan §4.4)
+                if token is None:
+                    continue                               # another replica leads this round
+                try:
+                    await self.reap_orphans()              # only the leader reaps
+                finally:
+                    await self._resign_reaper(token)
             except Exception as e:  # never let the loop die
                 logger.warning("reaper pass failed: %s", e)
+
+    async def _try_become_reaper(self) -> str | None:
+        """Return a token if this replica should reap this round, else None.
+
+        Degrade-safe: with the cluster lock off / no Redis / an election error,
+        every replica reaps (idempotent — today's behaviour). Only when the flag
+        is on do we elect a single leader per round (design §6.1).
+        """
+        if not self._dlock_enabled or self._redis is None:
+            return _NO_LEASE
+        token = uuid.uuid4().hex
+        try:
+            got = await self._redis.set(
+                "mcp:reaper:leader", token, nx=True, ex=self._reaper_lease
+            )
+        except Exception as e:
+            logger.warning("reaper election failed (%s); reaping anyway", e)
+            return _NO_LEASE
+        return token if got else None
+
+    async def _resign_reaper(self, token: str) -> None:
+        if not token or self._redis is None:   # _NO_LEASE sentinel or no client
+            return
+        try:
+            await self._redis.eval(_RELEASE_LUA, 1, "mcp:reaper:leader", token)
+        except Exception as e:
+            logger.warning("reaper resign failed (%s)", e)
 
     async def reap_orphans(self) -> None:
         """Delete sandboxes whose Session window has lapsed (Session-level kill).
