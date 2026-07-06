@@ -1,13 +1,12 @@
 ---
-title: "计划：预注册 Claude Code 或 opencode，项目级接入 Entra 保护的 MCP"
+title: "实施篇：预注册共享 Client，项目级接入 Claude Code / opencode / VS Code"
 date: 2026-07-05
 tags:
   - plan
+  - implementation
   - mcp
   - entra
   - oauth
-  - pkce
-  - client
 sources:
   - "docs/MCP-自定义Client接入-Entra与各Agent客户端支持对比.md"
   - "provisioning/aca/modules/identity.bicep"
@@ -16,59 +15,84 @@ sources:
   - "https://code.claude.com/docs/en/mcp"
   - "https://opencode.ai/docs/config/"
   - "https://opencode.ai/docs/mcp-servers/"
+  - "https://code.visualstudio.com/docs/copilot/chat/mcp-servers"
 ---
 
-# 计划：预注册 Claude Code 或 opencode，项目级接入
+# 实施篇：预注册共享 Client，项目级接入
 
-> 目标：让 **Claude Code 或 opencode**（二选一，或都接）作为 pre-registered client 连本项目
-> **Entra 保护的 MCP server**，用**项目级 mcp 配置**，并把 **redirect 回调端口钉死**。
-> 本计划是 [`MCP-自定义Client接入-...md`](./MCP-自定义Client接入-Entra与各Agent客户端支持对比.md)
-> 的落地版；OAuth 原理/时序图见那篇 §2.0、§3。
+> **这是纯实施篇**——只放工程步骤和配置。**为什么这么做**（OAuth 时序、redirect URI、PKCE、pre-auth
+> 与否、是否 RBAC、端口原理）全部在原理篇
+> [`MCP-自定义Client接入-...md`](./MCP-自定义Client接入-Entra与各Agent客户端支持对比.md)，本文只在需要处给页内指针。
+>
+> 目标：让 **VS Code / Claude Code / opencode** 三个 client 都能连本项目 **Entra 保护的 MCP server**，
+> 全部**项目级配置、互不冲突**，回调端口锁定。
 
-本计划额外回答四个问题：
-1. 项目级 mcp 配置到底放哪个文件？（纠正 `.claude` / `.opencode` 的说法）
-2. redirect 端口"两处 8080"是不是同一个？被占了怎么办？能不能锁死在一个 port？
-3. Bicep 端**不 pre-authorize** 会发生什么？能不能**完全不改 MCP server 的 app registration** 就 work？
-4. 为什么用户 login 完就能拿 authorization code？**MCP server 这边做了什么？是 RBAC 吗？**
-
----
-
-## 0. 前置纠正：项目级配置读哪个文件
-
-| Client | 项目级 MCP 配置文件 | 说明 |
-|---|---|---|
-| **Claude Code** | **`.mcp.json`**（repo 根） | 不是 `.claude/`。`.claude/settings.json` 是放**权限**（allow/ask/deny，见对比文档 §7），MCP server 定义在根目录的 `.mcp.json` |
-| **opencode** | **`opencode.json`**（repo 根） | 不是 `.opencode/`。那个目录放 `agents/`、`commands/`、`plugins/` 等；MCP server 定义在 `opencode.json` 的 `mcp` key |
-
-两者都是 **public client + PKCE，不需要 client secret**（原理见对比文档 §3）。
+**两个已定决策：**
+1. **Claude Code 和 opencode 共用一个 public client**（同一个 `client_id`）。VS Code 用它自己的内置
+   first-party client，无需注册。
+2. 三个 client 各自的 mcp 配置放在**各自的文件**里（见 §0），天然不打架。
 
 ---
 
-## 1. Entra：为每个 client 注册一个 client app registration
+## 0. 三个 client 的配置文件位置（互不冲突）
 
-> 建议**每个 client 一个 app registration**（`client_id` 独立，方便按 client 审计/吊销）。也可以共用一个
-> native public client app，但审计上不如分开清晰。
+| Client | 配置文件（项目级） | 顶层 key | 需要写 OAuth 吗 |
+|---|---|---|---|
+| **VS Code** | `.vscode/mcp.json` | `servers` | **否**——VS Code 是内置 pre-authorized client，**只写 URL** |
+| **Claude Code** | `.mcp.json`（repo 根） | `mcpServers` | 是（`oauth.clientId` + `callbackPort`） |
+| **opencode** | `opencode.json`（repo 根） | `mcp` | 是（`oauth.clientId` + `scope`） |
 
-对 Claude Code / opencode 各做一遍：
+**为什么不冲突**：三个是**不同文件、不同顶层 key**，每个 client 只读自己那一个，互相看不见。
+即使都在同一个 repo，也不会互相覆盖或误读。
 
-1. 新建 App Registration，例如 `DataOps MCP – Claude Code Client` / `… – opencode Client`
-2. **Authentication → Add a platform → Mobile and desktop applications**（public client）
-   - Redirect URI 填 **`http://localhost:8080/callback`**（端口/ path 见 §3）
+> 常见误区纠正：
+> - Claude Code 项目级 MCP 在 **`.mcp.json`（repo 根）**，不是 `.claude/`。`.claude/settings.json` 是放
+>   **权限**（原理篇 §10）。
+> - opencode 项目级配置在 **`opencode.json`（repo 根）**，不是 `.opencode/`（那目录放 agents/commands/
+>   plugins 等）。
+> - VS Code 的 MCP 在 **`.vscode/mcp.json`**（和 `settings.json` 分开）。
+
+---
+
+## 1. Entra：注册一个共享 public client（给 Claude Code + opencode 共用）
+
+只建**一个** app registration，两个 CLI 共用：
+
+1. 新建 App Registration，例如 `DataOps MCP – CLI Client (shared)`
+2. **Authentication → Add a platform → Mobile and desktop applications**（public client），加 Redirect URI：
+   - `http://localhost:8080/callback` —— 给 **Claude Code**（钉死 8080，见 §3）
+   - opencode 的回调地址（**path 需实测**，见 §3 / §5 第 1 步）——加为**第二条** Redirect URI
 3. 打开 **Allow public client flows**（`allowPublicClient = true`），**不创建 client secret**
-4. **API permissions → Add → My APIs →** 本 MCP server（`{name}-mcp-server`）→ Delegated →
-   勾选 **`user_impersonation`**
-5. 记下该 app 的 **Application (client) ID**，填进 §2 的 mcp 配置
+4. **API permissions → Add → My APIs →** 本 MCP server（`{name}-mcp-server`）→ Delegated → 勾选
+   **`user_impersonation`**
+5. 记下该 app 的 **Application (client) ID = `<shared-cli-client-id>`**，填进 §2
 
-> 第 4 步的"API permission"是加在**这个 client app** 上的，**不动 MCP server 的 app registration**——
-> 这点对 §4 很关键。
+> 一个 app registration 可以有多条 redirect URI，所以两个 CLI 共用没问题。
+> 第 4 步的 API permission 加在**这个 client app** 上，**不动 MCP server 的 app registration**
+> （能不能完全不改 server app、pre-auth 与否，见原理篇 §6）。
 
 ---
 
-## 2. 项目级 mcp 配置（两份）
+## 2. 三份项目级 mcp 配置
 
-把 `<mcp-url>`、`<mcp-app-id>`、各自的 `<client-app-id>` 替换成真值。
+把 `<mcp-url>`、`<mcp-app-id>`、`<shared-cli-client-id>` 换成真值。
 
-### 2.1 Claude Code — `.mcp.json`（repo 根）
+### 2.1 VS Code — `.vscode/mcp.json`（只写 URL）
+
+```json
+{
+  "servers": {
+    "dataops-mcp": {
+      "type": "http",
+      "url": "https://<mcp-url>/mcp"
+    }
+  }
+}
+```
+
+VS Code 是内置 pre-authorized client，碰到 401 会自己走 OAuth，**不需要写 clientId / 端口**。
+
+### 2.2 Claude Code — `.mcp.json`（repo 根）
 
 ```json
 {
@@ -76,7 +100,7 @@ sources:
     "dataops-mcp": {
       "type": "http",
       "url": "https://<mcp-url>/mcp",
-      "oauth": { "clientId": "<claude-code-client-app-id>", "callbackPort": 8080 }
+      "oauth": { "clientId": "<shared-cli-client-id>", "callbackPort": 8080 }
     }
   }
 }
@@ -86,14 +110,14 @@ sources:
 
 ```bash
 claude mcp add --transport http --scope project \
-  --client-id <claude-code-client-app-id> \
+  --client-id <shared-cli-client-id> \
   --callback-port 8080 \
   dataops-mcp https://<mcp-url>/mcp
 ```
 
-- **没有 secret**（public client）；`callbackPort: 8080` 同时钉死本地监听端口和 redirect 端口（见 §3）。
+**没有 secret**（public client）。登录：`/mcp` → Authenticate。
 
-### 2.2 opencode — `opencode.json`（repo 根）
+### 2.3 opencode — `opencode.json`（repo 根）
 
 ```json
 {
@@ -103,7 +127,7 @@ claude mcp add --transport http --scope project \
       "type": "remote",
       "url": "https://<mcp-url>/mcp",
       "oauth": {
-        "clientId": "<opencode-client-app-id>",
+        "clientId": "<shared-cli-client-id>",
         "scope": "api://<mcp-app-id>/user_impersonation"
       }
     }
@@ -111,175 +135,103 @@ claude mcp add --transport http --scope project \
 }
 ```
 
-- 同样**没有 `clientSecret`**（可选字段，public client 不填）。
-- ⚠️ opencode **没有"固定 callback 端口"字段**，端口由它自己挑 → 见 §3 的处理办法。
-
-登录：Claude Code 用 `/mcp` → Authenticate；opencode 用 `opencode mcp auth dataops-mcp`。浏览器登录一次即可。
+**没有 `clientSecret`**（可选字段，public client 不填）。opencode **没有固定端口字段** → 端口策略见 §3。
+登录：`opencode mcp auth dataops-mcp`。
 
 ---
 
-## 3. redirect 端口：其实只有一个 port，两处必须一致
+## 3. 端口锁定：本项目的选择
 
-### 3.1 "两个 8080" 是同一个 port
+> 原理（"两处 8080 是同一个 port"、端口被占怎么办、Entra 对 localhost 忽略端口只认 path）见原理篇 §3.4。
 
-你担心的"第一次 callback port 和第二次 callback port"其实是**同一个端口**，只是出现在两个地方，必须相等：
+本项目采用：
 
-| 出现位置 | 角色 |
-|---|---|
-| 时序图 Step 8：Claude Code 本地起 HTTP 监听 `127.0.0.1:8080` | **接** authorization code 的本地服务 |
-| 时序图 Step 9 / Entra 里注册的 redirect URI `http://localhost:8080/callback` | 告诉 Entra **把 code 送到哪** |
-
-`--callback-port 8080`（或 `oauth.callbackPort: 8080`）**一次同时设定这两处**：本地监听绑 8080，
-redirect_uri 也用 8080。Entra 把 code 打到 8080，本地监听正好在 8080 接住。**所以"锁在一个 port" =
-就是 `--callback-port` 干的事，本来就只有一个 port。**
-
-### 3.2 端口被占了怎么办
-
-你的担心是对的：**若把端口钉死成 8080，而 8080 已被占用，Step 8 的本地监听就绑不上 → OAuth 直接失败。**
-两种兜底：
-
-**办法 A（推荐给 Claude Code）：钉死一个不常用的端口。**
-选一个基本不会冲突的高端口（如 `8765`、`53682`），Entra 注册 `http://localhost:8765/callback`，客户端
-`--callback-port 8765`。简单、确定。
-
-**办法 B（更抗冲突，opencode 必须用这个）：不钉端口，靠 Entra 的 localhost 端口无关匹配。**
-Microsoft 官方明确：
-
-> *"The login server cannot distinguish between redirect URIs when only the port differs."*
-> 且 *"you can register `http://localhost`, `http://localhost:3000/abc`（paths and ports are okay）"*
-
-也就是 **Entra 匹配 localhost redirect 时忽略端口、只认 path**。于是：
-
-- 在 Entra 注册 `http://localhost:8080/callback`（端口随便填一个，**关键是 path `/callback`**）。
-- 客户端**不钉端口**（Claude Code 省掉 `--callback-port`；opencode 本来就没这字段）→ 每次挑一个空闲
-  随机端口 → 只要 path 是 `/callback`，Entra 照样匹配通过，天然躲开端口冲突。
-
-> 注意 path **必须**对上（path 是被严格匹配的，端口不是）。Claude Code 的 path 固定是 `/callback`
-> （官方："redirect URI of the form `http://localhost:PORT/callback`"）。
-> **opencode 的 redirect path 需实测确认**——见 §6 先跑一次抓 `redirect_uri`，把它的 path 注册到 Entra。
-
-> 另一个细节：Microsoft 推荐 native client 用 `127.0.0.1` 而非 `localhost`（避免监听到非 loopback
-> 网卡），但 http + `127.0.0.1` 在门户 UI 里可能要改 manifest 的 `replyUrlsWithType`。Claude Code 用
-> `localhost`，直接门户注册 `http://localhost:PORT/callback` 即可。
-
-### 3.3 小结
-
-- 想要**确定性** → 办法 A（钉死一个冷门端口，两处一致）。
-- 想要**抗端口冲突** / 用 opencode → 办法 B（Entra 注册 `…/callback`，客户端随机端口，靠端口无关匹配）。
+- **Claude Code：钉死 8080。** 配 `--callback-port 8080`（或 `oauth.callbackPort: 8080`），Entra 注册
+  `http://localhost:8080/callback`。两处一致、确定。
+  - 若本机 8080 常被占，换一个冷门端口（如 `8765`），两处同步改。
+- **opencode：不钉端口（它没有该字段），靠 Entra 的 localhost 端口无关匹配。**
+  - **先实测抓 opencode 的 redirect path**（§5 第 1 步），把该 **path**（端口随便，Entra 忽略端口）注册到
+    共享 client 的 Redirect URI，例如 `http://localhost:8080/<opencode-callback-path>`。
+  - path **必须**和 opencode 实际用的一致（path 被严格匹配，端口不是）。
 
 ---
 
-## 4. Bicep 端：pre-authorize 与否 & 能不能不改 MCP server 的 app registration
+## 4. Bicep：pre-authorize 共享 client（推荐，免 consent 弹窗）
 
-### 4.1 不 pre-authorize 会发生什么
+> 是否非改不可？不改也能 work（靠 consent），取舍见原理篇 §6.2 / §6.3。下面是"预授权、免弹窗"的落地改动。
 
-pre-authorize（写在 **MCP server app** 的 `preAuthorizedApplications`）唯一的作用是**免掉 consent 弹窗**。
-不加它，OAuth **技术上照样能走**，区别只在第一次登录：
+`provisioning/aca/modules/identity.bicep`——加一个参数，并把共享 client 加进 `preAuthorizedApplications`：
 
-| 租户 user-consent 设置 | 不 pre-auth 的结果 |
-|---|---|
-| 允许用户自助同意 | 用户第一次看到一次 consent 弹窗（"Claude Code 想代表你访问 DataOps MCP"）→ 点"同意" → 记一条 per-user grant → 之后不再弹 |
-| **关闭了用户同意**（很多企业租户） | 用户点不了，显示"需管理员批准" → 卡住，需**管理员 consent 一次** |
+```bicep
+@description('Client ID of VS Code (well-known).')
+param vscodeClientId string = 'aebc6443-996d-45c2-90f0-388ff96faa56'
 
-本项目的 `user_impersonation` scope 在 `identity.bicep` 里是 `type: 'User'`（带 userConsent 文案），
-**属于可用户自助同意的低权限 scope**——所以只要租户没禁用户同意，不 pre-auth 也就是"第一次多点一下"。
+@description('Client ID of the shared CLI public client (Claude Code + opencode). Empty = 不预授权。')
+param cliClientId string = ''
 
-### 4.2 能不能完全不改 MCP server 的 app registration？——能
+// ... mcpServerApp.api 里：
+    preAuthorizedApplications: [
+      {
+        appId: vscodeClientId
+        delegatedPermissionIds: [ userImpersonationScopeId ]
+      }
+      ...(empty(cliClientId) ? [] : [
+        {
+          appId: cliClientId
+          delegatedPermissionIds: [ userImpersonationScopeId ]
+        }
+      ])
+    ]
+```
 
-关键区分：**pre-authorize 改的是 server app；而让 client 拿到 scope 还有另一条路——consent grant，
-它不改 server app 的定义。** 要让 Claude Code / opencode work，最少只需要：
+`provisioning/aca/main.bicep`——透传参数：
 
-1. 新建 **client app registration** + redirect URI + `allowPublicClient`（全新对象，**不碰 server app**）
-2. 在 **client app** 上加 API permission：server 的 `user_impersonation` delegated scope（改的是 **client app**）
-3. **Consent**：用户第一次点"同意"（生成 per-user grant）**或** 管理员 consent 一次（生成 grant 对象）
-   —— grant 是**独立对象，不是对 server app registration 定义的编辑**
+```bicep
+module identity 'modules/identity.bicep' = {
+  name: 'identity'
+  scope: rg
+  params: {
+    name: name
+    cliClientId: cliClientId   // 从顶层 param 传入 §1 拿到的 <shared-cli-client-id>
+  }
+}
+```
 
-所以结论：
-
-> **可以不改 MCP server 的 app registration 就让它 work**——前提是**能拿到 consent**（租户允许用户自助
-> 同意，或有管理员愿意 consent 一次）。**pre-authorize 只是省掉那次 consent 点击的优化，不是功能必需。**
-
-什么时候你**不得不**碰 server app（加 pre-auth）？只有当**租户禁了用户同意、又不方便让管理员逐个
-consent**，想用"服务端预授权"一次性解决所有用户时——那就把 client 的 appId 加进 server app 的
-`preAuthorizedApplications`（改法见对比文档 §2.2）。
-
-### 4.3 OBO（闸③）不用动
-
-`grant_obo_admin_consent`（AllPrincipals，MCP server SP → Graph）与用哪个 client 无关，换 client 不需要
-改动。
-
----
-
-## 5. 概念澄清：为什么 login 完就能拿 authorization code？MCP server 做了什么？是 RBAC 吗？
-
-这是最容易误解的一点。**authorization code 是 Entra（authorization server）发的，不是 MCP server 发的。**
-
-### 5.1 发 code 的是 Entra，MCP server 在这一步完全不参与
-
-看时序图（对比文档 §2.0）：`/authorize` → 登录 → 302 带 code，全程在 **浏览器 ↔ Entra** 之间。
-**MCP server 在整个 authorize / token 交换里一次都没被调用。** 它只在两头出现：
-
-- **最前面**：Step 1–2，MCP server 返回 `401 + WWW-Authenticate`，告诉 client "去找 Entra、要这个
-  scope"。
-- **最后面**：Step 19–20，MCP server 收到 Bearer token，**校验 JWT**（`aud` / `scp` / 签名 / issuer）。
-
-中间发不发 code、发给谁，**MCP server 说了不算，Entra 说了算**。
-
-### 5.2 Entra 凭什么在 login 后就发 code？两道闸，都在 Entra
-
-用户 login 完能拿到 code，是因为 Entra 同时满足了两件事：
-
-1. **认证（authN，"你是谁"）**：用户在 Entra 登录页登录成功（+ MFA）。
-2. **授权（authZ，"这个 client 能不能要这个 scope"）**：Entra 检查该 client 对
-   `api://<mcp>/user_impersonation` 有没有被允许——**要么 pre-authorized，要么有 consent grant**（§4）。
-
-两条都过，Entra 才把 authorization code 发到 client 的 redirect URI。**这跟 MCP server 无关，也不是
-MCP server 在放行。**
-
-### 5.3 这是 RBAC 吗？——不是
-
-- **发 code / 发 token**：Entra 的 authN + client authZ，如上，**不是 RBAC**。
-- **MCP server 的"谁能用哪个 tool"**：那是 token 校验**通过之后**、在 **runtime** 做的——MCP server 用
-  **OBO** 拿用户 token 换 Graph token，查用户的 **AD group** 成员，决定 tool 可见性（见
-  [`mcp_discussion.md`](./mcp_discussion.md) §2/§3）。这是**基于组的 tool 门控**，最接近"RBAC"的东西，但
-  它发生在**拿到 token 之后**，和"发 code"是两码事。
-- **Azure RBAC**：只作用在 **worker Service Principal** 执行 `az` 命令时的资源权限边界，和用户登录 /
-  发 code 完全无关。
-
-一句话：
-
-> **login 后能拿 code，是 Entra 完成了"认证 + client 授权"；MCP server 只负责最前面发 401 指路、最后面
-> 验 token。tool 级的组门控是 MCP server 在 runtime 用 OBO+Graph 做的，那才沾"RBAC"的边，但不在发 code
-> 这条链上。**
+- 传了 `cliClientId` → Claude Code / opencode 首次连接**无 consent 弹窗**，和 VS Code 体验一致。
+- 不传（留空）→ 走 consent（用户第一次点一次同意，或 admin consent 一次），**不改 server app 的定义**
+  （原理篇 §6.3）。
+- **OBO（闸③）不用动**（原理篇 §6.4）。
 
 ---
 
-## 6. 验证 checklist
+## 5. 验证 checklist
 
-1. **抓 redirect_uri**（尤其 opencode）：发起登录时看浏览器打开的 `/authorize` URL 里的 `redirect_uri=`
-   参数，或看客户端本地监听地址，确认 **path**（`/callback`?）和端口策略，与 Entra 注册一致。
-2. **登录能过**：浏览器 Entra 登录 → 落地页"登录成功" → 客户端显示已连接。
-3. **token 正确**（可选）：解码 access token，确认 `aud = api://<mcp-app-id>`、`scp` 含
-   `user_impersonation`、`azp` = 你的 client app id。
-4. **`/mcp` 200 + tools 出现**：能列出 `diagnose_bash` / `action_bash`。
-5. **（对比文档 §7）**：如需 `action_bash` 强制人工审批，在 `.claude/settings.json` 配 `ask` 规则。
+1. **抓 opencode 的 redirect_uri**：`opencode mcp auth dataops-mcp` 时，看浏览器打开的 `/authorize` URL
+   里的 `redirect_uri=` 参数（拿到它的 **path** 和端口行为），把该 path 注册到共享 client（§1 第 2 步 / §3）。
+2. **VS Code**：打开工作区 → MCP server 连接 → 首次触发登录 → 浏览器 Entra 登录 → 连上。
+3. **Claude Code**：`/mcp` → Authenticate → 浏览器登录 → 落地页"登录成功" → 已连接。
+4. **opencode**：`opencode mcp auth dataops-mcp` → 登录 → 连接；`opencode mcp list` 看 auth 状态。
+5. **token 正确**（可选）：解码 access token，确认 `aud = api://<mcp-app-id>`、`scp` 含
+   `user_impersonation`、`azp = <shared-cli-client-id>`。
+6. **三者并存**：三个 client 各读各的文件（`.vscode/mcp.json` / `.mcp.json` / `opencode.json`），互不影响。
+7. **（可选）action_bash 强制审批**：按原理篇 §10.3 在 `.claude/settings.json` 配 `ask` 规则。
 
 ---
 
-## 7. 回滚
+## 6. 回滚
 
-- 删掉项目根的 `.mcp.json` / `opencode.json` 里对应条目即可断开。
-- Entra 侧：删掉新建的 client app registration（若共用则移除对应 redirect URI）；如加过 pre-auth，从
-  server app 的 `preAuthorizedApplications` 移除该条。
-- 没改过 server app / OBO 的话，无其它清理。
+- 删项目根 `.mcp.json` / `opencode.json` 及 `.vscode/mcp.json` 里对应条目即断开。
+- Entra：删共享 client app registration（或移除其 Redirect URI / API permission）。
+- Bicep：把 `cliClientId` 留空（或移除该 param 与 preAuthorizedApplications 里那条）重新部署。
+- 没动过 server app 定义 / OBO 的话，无其它清理。
 
 ---
 
 ## 参考资料
 
-- [`MCP-自定义Client接入-...md`](./MCP-自定义Client接入-Entra与各Agent客户端支持对比.md) —— OAuth 原理、时序图（§2.0）、PKCE（§3.3）、各 client 对比
-- [`mcp_discussion.md`](./mcp_discussion.md) —— identity 模型、group 门控、per-tool-call hook
-- `provisioning/aca/modules/identity.bicep` / `provisioning/aca/main.bicep` —— server app / `preAuthorizedApplications` / OBO
+- [`MCP-自定义Client接入-...md`](./MCP-自定义Client接入-Entra与各Agent客户端支持对比.md) —— **原理篇**（时序图 §3、PKCE §4、发 code/RBAC §5、pre-auth §6、端口 §3.4）
+- `provisioning/aca/modules/identity.bicep` / `provisioning/aca/main.bicep`
 - [Microsoft – Redirect URI (reply URL) best practices（localhost 端口/path 匹配）](https://learn.microsoft.com/en-us/entra/identity-platform/reply-url)
 - [Claude Code – Connect to MCP（`--client-id` / `--callback-port` / `.mcp.json`）](https://code.claude.com/docs/en/mcp)
-- [opencode – Config（`opencode.json` 位置）](https://opencode.ai/docs/config/) / [MCP servers（`mcp` / `oauth`）](https://opencode.ai/docs/mcp-servers/)
+- [opencode – Config（`opencode.json` 位置）](https://opencode.ai/docs/config/) / [MCP servers](https://opencode.ai/docs/mcp-servers/)
+- [VS Code – MCP servers（`.vscode/mcp.json`）](https://code.visualstudio.com/docs/copilot/chat/mcp-servers)
