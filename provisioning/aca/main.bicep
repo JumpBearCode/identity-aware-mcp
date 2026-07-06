@@ -178,6 +178,7 @@ output AZURE_SUBSCRIPTION_ID string = subscription().subscriptionId
 output RESOURCE_GROUP string = rg.name
 output LOCATION string = location
 output MCP_APP_ID string = identity.outputs.mcpAppId
+output CLI_CLIENT_APP_ID string = identity.outputs.cliClientAppId
 output DIAGNOSE_GROUP_ID string = identity.outputs.diagnoseGroupId
 output ACTION_GROUP_ID string = identity.outputs.actionGroupId
 output DIAGNOSE_SP_APP_ID string = identity.outputs.diagnoseSpAppId

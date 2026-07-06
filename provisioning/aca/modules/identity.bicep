@@ -26,6 +26,11 @@ param name string
 @description('Client ID of VS Code (well-known). Override for a different MCP client.')
 param vscodeClientId string = 'aebc6443-996d-45c2-90f0-388ff96faa56'
 
+@description('Loopback redirect URIs for the shared CLI public client (Claude Code / opencode), RFC 8252.')
+param cliClientRedirectUris array = [
+  'http://localhost:8080/callback'
+]
+
 var graphAppId = '00000003-0000-0000-c000-000000000000'
 
 // Delegated Graph permission IDs the MCP server requests.
@@ -75,6 +80,11 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
         isEnabled: true
       }
     ]
+    // NOTE: only VS Code is pre-authorized here. The CLI client (below) is
+    // intentionally NOT pre-authorized (relies on user/admin consent). Adding it
+    // here would create a mcpServerApp<->cliClientApp reference cycle; to skip the
+    // consent screen later, pre-authorize the CLI client out-of-band (az) — see
+    // docs/multi-client-implementation/MCP-自定义Client接入-...md §6.
     preAuthorizedApplications: [
       {
         appId: vscodeClientId
@@ -86,6 +96,36 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
 
 resource mcpServerSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
   appId: mcpServerApp.appId
+}
+
+// --- Shared CLI public client (Claude Code / opencode) ---
+// Public client: PKCE, no secret, loopback redirect (RFC 8252). Requests the MCP
+// server's user_impersonation delegated scope; consent is granted per-user (or by
+// an admin) at first sign-in since it is not pre-authorized above.
+// KNOWN LIMITATION (2026-07): the interactive OAuth flow from Claude Code / opencode
+// is currently blocked by AADSTS9010010 (RFC 8707 `resource` vs Entra v2 `scope`).
+// The app registration itself is valid IaC; see
+// docs/multi-client-implementation/Bug剖析-AADSTS9010010-MCP的resource参数撞上Entra-v2.md.
+resource cliClientApp 'Microsoft.Graph/applications@v1.0' = {
+  uniqueName: '${name}-cli-client'
+  displayName: 'DataOps MCP - CLI Client (shared)'
+  signInAudience: 'AzureADMyOrg'
+  isFallbackPublicClient: true
+  publicClient: {
+    redirectUris: cliClientRedirectUris
+  }
+  requiredResourceAccess: [
+    {
+      resourceAppId: mcpServerApp.appId
+      resourceAccess: [
+        { id: userImpersonationScopeId, type: 'Scope' }
+      ]
+    }
+  ]
+}
+
+resource cliClientSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
+  appId: cliClientApp.appId
 }
 
 resource graphSp 'Microsoft.Graph/servicePrincipals@v1.0' existing = {
@@ -139,6 +179,8 @@ resource actionSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
 }
 
 output mcpAppId string = mcpServerApp.appId
+// Shared CLI public client appId — put into .mcp.json (Claude Code) and opencode.json.
+output cliClientAppId string = cliClientApp.appId
 output diagnoseGroupId string = diagnoseGroup.id
 output actionGroupId string = actionGroup.id
 output diagnoseSpAppId string = diagnoseSpApp.appId
