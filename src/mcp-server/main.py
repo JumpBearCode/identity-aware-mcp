@@ -38,6 +38,13 @@ DIAGNOSE_GROUP_ID = os.environ["DIAGNOSE_GROUP_ID"]
 ACTION_GROUP_ID = os.environ["ACTION_GROUP_ID"]
 BASE_URL = os.environ.get("MCP_SERVER_BASE_URL", "http://localhost:8080")
 
+# Plan A: expose a second /mcpproxy endpoint that strips the RFC 8707 `resource`
+# param before talking to Entra, so clients like Claude Code / opencode dodge
+# AADSTS9010010. /mcp (VS Code, direct-to-Entra) is left untouched. See mcpproxy.py
+# and docs/multi-client-implementation/计划-mcpproxy-*.md. Default on; set false to
+# fall back to /mcp only.
+MCPPROXY_ENABLED = os.environ.get("MCPPROXY_ENABLED", "true").lower() in ("1", "true", "yes")
+
 # Execution backend: local docker workers (default) or ACA sandboxes. Both sit
 # behind the same Executor interface; see executor.py / sandbox_manager.py.
 executor = make_executor()
@@ -250,6 +257,22 @@ async def health(_request):
 
 
 app = mcp.http_app()
+
+# Plan A: bolt the resource-stripping /mcpproxy endpoint onto the same app. It
+# reuses this app's StreamableHTTP session manager and the same AzureJWTVerifier,
+# so /mcpproxy clients end up holding a real Entra token — oid / OBO / group gating
+# are identical to /mcp. All /mcp routes are left untouched.
+if MCPPROXY_ENABLED:
+    from mcpproxy import install_proxy_endpoint
+
+    install_proxy_endpoint(
+        app,
+        mcp_path="/mcp",
+        base_url=BASE_URL,
+        tenant_id=TENANT_ID,
+        mcp_app_id=MCP_APP_ID,
+        required_scopes=verifier.required_scopes,
+    )
 
 # Ping Redis at startup: a clear connectivity log, and it warms the connection
 # pool on the server's event loop (so the first request never pays first-connect
