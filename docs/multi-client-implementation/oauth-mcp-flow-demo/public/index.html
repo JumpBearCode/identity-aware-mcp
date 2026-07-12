@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MCP · OAuth 授权流可视化教学</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">🔐</span>
+      <div class="brand-text">
+        <h1>Identity-Aware MCP · 授权流可视化</h1>
+        <p>一步一步走完 <code>/mcpproxy</code> 的 14 步时序图 —— 看每一次请求 / 响应的真实 JSON</p>
+      </div>
+    </div>
+    <div class="mode-switch" role="tablist" aria-label="模式">
+      <button id="modeDemo" class="mode-btn active" role="tab">Demo 回放</button>
+      <button id="modeLive" class="mode-btn" role="tab">Live 真实调用</button>
+    </div>
+  </header>
+
+  <div class="flowbar">
+    <div class="flow-switch" role="tablist" aria-label="流程">
+      <button id="flowProxy" class="flow-btn active" role="tab">
+        <span class="fb-title">🪄 MCP proxy</span><span class="fb-sub">剥离 resource · 14 步</span>
+      </button>
+      <span class="flow-vs">对比</span>
+      <button id="flowDirect" class="flow-btn" role="tab">
+        <span class="fb-title">⚙️ MCP 直连</span><span class="fb-sub">直连 Entra · 11 步</span>
+      </button>
+    </div>
+    <p id="flowTagline" class="flow-tagline"></p>
+  </div>
+
+  <main class="layout">
+    <!-- 左：时序图 -->
+    <section class="diagram-pane">
+      <div class="diagram-scroll" id="diagramScroll">
+        <svg id="diagram" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+    </section>
+
+    <!-- 右：当前步骤详情 -->
+    <section class="detail-pane">
+      <div class="step-head">
+        <div class="step-badge" id="stepBadge">0 / 14</div>
+        <div class="step-titles">
+          <h2 id="stepTitle">准备就绪</h2>
+          <p id="stepDesc">点击 <b>▶ 播放</b> 或 <b>下一步</b>，从“无 token 撞 401”开始，一步步走完整条授权流。</p>
+        </div>
+        <span class="step-dir" id="stepDir"></span>
+      </div>
+
+      <div id="highlights" class="highlights"></div>
+
+      <div class="wire" id="wire">
+        <!-- request / response / note 卡片由 JS 注入 -->
+        <div class="placeholder" id="placeholder">
+          <div class="placeholder-inner">
+            <div class="pl-icon">🎬</div>
+            <p>这条流水线在 Client、代理路由、Entra、MCP 端点四者之间传递消息。</p>
+            <p class="muted">Demo 模式用贴近真实抓包的数据回放；Live 模式会真正调用你的 MCP server（含浏览器登录）。</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live 模式的登录卡（默认隐藏） -->
+      <div id="livePanel" class="live-panel hidden"></div>
+    </section>
+  </main>
+
+  <footer class="controls">
+    <button id="btnRestart" class="ctl" title="重来">⟲ 重来</button>
+    <button id="btnPrev" class="ctl" title="上一步">◀ 上一步</button>
+    <button id="btnPlay" class="ctl ctl-primary" title="播放 / 暂停">▶ 播放</button>
+    <button id="btnNext" class="ctl" title="下一步">下一步 ▶</button>
+    <div class="spacer"></div>
+    <label class="speed">
+      速度
+      <input id="speed" type="range" min="0.5" max="2.5" step="0.5" value="1" />
+      <span id="speedVal">1.0×</span>
+    </label>
+    <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+  </footer>
+
+  <script src="steps.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
