@@ -118,6 +118,42 @@ sequenceDiagram
 （client↔Entra，端到端），`state` 由 client 自己 round-trip。我们**不生成自己的 PKCE、不发自己的 code、不签自己的
 token、不存任何东西**。
 
+### 3.1 全部 endpoint / route 清单（真实值 + 与上面时序图逐步对应）
+
+下表把 `install_proxy_endpoint` 注册的**每一条路由**都列全，填上**真实值**（`<base>` =
+`https://dataops-aca-mcp.icyrock-96f978c0.westus2.azurecontainerapps.io`，`<tenant>` =
+`9ea91fbb-1313-4312-a601-b6d9ab7d4de3`），并标出它对应上面时序图的**哪一步**。
+
+**A) 本容器新增的 `/mcpproxy` 路由（我们自写）**
+
+| 方法 · 路径（真实值） | handler | 干什么 | 时序图步骤 |
+|---|---|---|---|
+| `GET·POST·DELETE <base>/mcpproxy` | `proxy_mcp_endpoint`（`RequireAuthMiddleware` 包着共用的 streamable app） | MCP 端点本体：无 token→401 指向我们的 PRM；有 token→校验后进 tools | **无 token：1→2**；**有 token：13→14** |
+| `GET <base>/.well-known/oauth-protected-resource/mcpproxy` | `protected_resource_metadata` | RFC 9728：告诉 client「我的 AS 是我自己」 | **3** |
+| `GET <base>/.well-known/oauth-authorization-server/mcpproxy` | `authorization_server_metadata` | RFC 8414：宣告 authorize/token 端点、无 `registration_endpoint` | **4** |
+| `GET <base>/mcpproxy/.well-known/oauth-authorization-server` | `authorization_server_metadata`（**同一个 handler**，见 §4.3） | 同上，换发现路径写法，兼容另一类 client | **4**（等价） |
+| `GET <base>/mcpproxy/authorize` | `authorize` | 删 `resource` + 补 `offline_access`，302 到 Entra | **收=5，发=6** |
+| `POST <base>/mcpproxy/token` | `token` | 删 `resource`，转发 Entra，原样回传 | **收=9，转发=10，回传=12** |
+
+**B) 上游 Entra（不是本容器的路由，但在流程里；由我们代替 client 打）**
+
+| 方法 · 路径（真实值） | 干什么 | 时序图步骤 |
+|---|---|---|
+| `GET https://login.microsoftonline.com/<tenant>/oauth2/v2.0/authorize` | 我们 302 过去（已删 resource）；浏览器在此登录 | **6→7→8** |
+| `POST https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token` | 我们 `token` handler 转发过去（已删 resource）→ 发真 token | **10→11** |
+
+**C) 既有 `/mcp` 路由（本次一字未改，VS Code 走这条，不在上面时序图里）**
+
+| 方法 · 路径（真实值） | 干什么 |
+|---|---|
+| `GET·POST·DELETE <base>/mcp` | 原 MCP 端点；401 指向 `/mcp` 的 PRM（AS=Entra） |
+| `GET <base>/.well-known/oauth-protected-resource/mcp` | RFC 9728：`authorization_servers=[https://login.microsoftonline.com/<tenant>/v2.0]`（直连 Entra） |
+| `GET <base>/health` | 健康检查 |
+
+> 一眼看懂对应关系：**发现三连**（步骤 3/4）= B 组两份 metadata；**授权跳转**（步骤 5/6）= `/mcpproxy/authorize`；
+> **换 token**（步骤 9/10/12）= `/mcpproxy/token`；**真正干活**（步骤 1/2 与 13/14）= `/mcpproxy` MCP 端点本体。
+> 步骤 7/8（浏览器登录 + 回调）**完全在 client↔Entra 之间**，我们没有任何路由参与——这正是"无状态"的来源。
+
 ---
 
 ## 4. 代码实现详解
@@ -134,10 +170,23 @@ token、不存任何东西**。
 
 ### 4.2 关键技巧：把同一个 StreamableHTTP app 在第二个路径上再挂一次
 
-`/mcp` 那条路由的 endpoint 是 `RequireAuthMiddleware` 包着一个 `StreamableHTTPASGIApp`（它的 session_manager 在 app
-lifespan 里只被设置一次）。MCP 的 session 是按 `mcp-session-id` 请求头分的、**与 URL 路径无关**，所以把**同一个**
-`StreamableHTTPASGIApp` 在 `/mcpproxy` 上再包一层 `RequireAuthMiddleware` 挂一次，就得到了第二个功能完全相同、但
-401 指向不同元数据的 MCP 端点——**共用一个 session manager，不需要动 lifespan、不需要第二个 FastMCP 实例**。
+**先说清楚"Streamable HTTP"是什么。** 它是 MCP 规范（2025 版）定义的**传输层**，取代了老的 "HTTP+SSE"。一句话：
+**一个 HTTP 端点承载整条 MCP 会话**——
+
+- `POST`：client 把 JSON-RPC 消息发上来；服务端要么回一个 JSON、要么升级成一条 **SSE 流**（用于流式/服务端通知）；
+- `GET`：开一条服务端→client 的 SSE 流（服务端主动推消息用）；
+- `DELETE`：结束会话；
+- 全程用请求头 **`mcp-session-id`** 把同一个逻辑会话的多次 HTTP 请求串起来。
+
+在 FastMCP 里，实现这个传输的 ASGI 对象叫 `StreamableHTTPASGIApp`，它内部的 `session_manager` **按 `mcp-session-id`
+分会话、与 URL 路径无关**。这正是本技巧成立的前提。
+
+**我们到底做了什么（是的，捅进了 wrapper）。** `mcp.http_app()` 是公开 API，返回一个 Starlette app。我们没有停在这
+一层，而是**伸手进这个 Starlette app 的路由表**：找到 `/mcp` 那条路由，把外面的 `RequireAuthMiddleware` **拆开**、
+取出里面那个 `StreamableHTTPASGIApp`，然后用 Starlette 的底层 `Route` 把**同一个对象**在 `/mcpproxy` 上再挂一次
+（外面换一层指向不同 401 元数据的 `RequireAuthMiddleware`）。因为 session 按请求头分、与路径无关，同一个对象挂在两个
+路径**共用一个 session manager**，两个端点的会话各自独立、互不干扰。结果：**不需要动 lifespan、不需要第二个 FastMCP
+实例**。
 
 ```python
 def find_streamable_asgi_app(app, mcp_path: str):
@@ -161,6 +210,21 @@ proxy_mcp_endpoint = RequireAuthMiddleware(streamable_app, required_scopes, prm_
 > ⚠️ 这里**依赖了 FastMCP/mcp SDK 的内部结构**（路由里 `RequireAuthMiddleware.app` 这层包装）。好处是零重复代码；
 > 代价是 SDK 若改了这层包装，`find_streamable_asgi_app` 会**抛 RuntimeError 让容器起不来（响亮失败，不是静默出错）**。
 > 见 §10 缺点。
+
+**这样就不用再起一个 FastMCP server 了吗？对。** 另一条路（计划文档里设想的）是：用工厂函数造**第二个 `FastMCP` 实例**
+（同样的 tools）、各自 `http_app()`，再把两个 app 挂到父 Starlette 下、**合并两套 lifespan**。我避开了它。两种做法的好坏：
+
+| | **复用同一个 app（本实现）** | 起第二个 FastMCP 实例（未采用） |
+|---|---|---|
+| 代码量 | 少（只多几条路由 + 一个 unwrap） | 多（工厂 + 挂载 + 合并 lifespan） |
+| session manager / lifespan | **1 套**，不用碰 | 2 套，必须把两个 session manager 都在 lifespan 里起来 |
+| tools / verifier / OBO / group cache | **同一批对象**，零分叉、零额外内存 | 两批对象，得靠工厂保持同步；多一份内存 |
+| 对 SDK 的依赖 | **耦合内部包装**（unwrap `RequireAuthMiddleware.app`），升级要回归 | 只用公开 API（`http_app()` + mount），不碰内部 |
+| 能否让两端点**不一样** | **不能**：必然共享同一批 tools/verifier/会话命名空间 | 能：各自可用不同 tools/auth/配置，完全隔离 |
+
+**结论**：本场景两端点**只有发现元数据不同、其余全同**，所以"复用"是明显更划算的选择——省掉一整块 lifespan/实例管理，
+换来一个会"响亮失败"的内部依赖。**如果哪天 `/mcpproxy` 需要和 `/mcp` 长得不一样**（不同 tools、不同 verifier），就该
+切回"第二个实例"的写法。
 
 ### 4.3 两份发现元数据（让 client 把我们当成 AS，且不 DCR）
 
@@ -189,18 +253,26 @@ async def authorization_server_metadata(_request):
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],   # public client，无 secret
-        "scopes_supported": [api_scope, "offline_access", "openid", "profile"],
+        "scopes_supported": [api_scope, "offline_access"],
         # 注意：没有 registration_endpoint → 不触发 DCR
     })
 ```
 
-因为 issuer 带了 `/mcpproxy` 路径，不同 client 的 RFC 8414 发现路径写法不同，所以这份 metadata **同时挂在两个位置**
-兼容两种 client：
+**为什么同一份 metadata 要挂在两个地址？** 这两条不是"重复路由"——它们**路径不同、handler 相同**：
 
 ```python
-Route("/.well-known/oauth-authorization-server" + proxy_path, ...)  # RFC 8414 路径插入式
-Route(proxy_path + "/.well-known/oauth-authorization-server", ...)  # 新版 MCP client 的路径追加式
+Route("/.well-known/oauth-authorization-server" + proxy_path, ...)  # → /.well-known/oauth-authorization-server/mcpproxy
+Route(proxy_path + "/.well-known/oauth-authorization-server", ...)  # → /mcpproxy/.well-known/oauth-authorization-server
 ```
+
+根因是我们的 AS `issuer` 带了路径（`https://…/mcpproxy`），而**不同 client 对"带路径的 issuer 该去哪拿 metadata"算法不一样**：
+- **RFC 8414 §3.1（路径插入式）**：把 `/.well-known/oauth-authorization-server` 插在 host 和 path 之间
+  → `…/.well-known/oauth-authorization-server/mcpproxy`；
+- **OIDC Discovery 风格（路径追加式）**：在 issuer 后面直接追加 → `…/mcpproxy/.well-known/oauth-authorization-server`。
+
+我不预设 client 用哪种，就把**同一个 handler 挂在两个地址**，谁来都发现得到。
+> 若把 issuer 设成无路径的根（`https://host`），就只需一条 well-known、没有这个歧义——但我选带路径的 issuer 是为了让
+> `/mcpproxy` 命名空间自包含、与 resource URL 对称。多挂一条是这个选择的代价，见 §8。
 
 ### 4.4 `/mcpproxy/authorize`：删 resource + 归一化 scope + 302 到 Entra
 
@@ -217,7 +289,7 @@ async def authorize(request):
 但**保留** client 原本要的 scope：
 
 ```python
-_RESERVED_SCOPES = ("offline_access", "openid", "profile")
+_RESERVED_SCOPES = ("offline_access",)   # 只补 offline_access（换 refresh_token）；openid/profile 无用已去掉
 def _ensure_scopes(scope, api_scope):
     parts = scope.split() if scope else []
     for needed in (api_scope, *_RESERVED_SCOPES):
@@ -225,6 +297,12 @@ def _ensure_scopes(scope, api_scope):
             parts.append(needed)
     return " ".join(parts)
 ```
+
+> **哪些 scope 是必需的？** 只有 `user_impersonation`（自定义 API scope）是**必需**的——它决定 Entra 把 `aud` 钉成我们的
+> API，且是服务端 `AzureJWTVerifier(required_scopes=["user_impersonation"])` **唯一校验**的 scope。reserved scope
+> **服务端都不看**，只影响 Entra 回给 client 什么，所以现在**只补 `offline_access`**（换 refresh_token，让 client 在 access
+> token ~1h 过期后能静默续，不用重弹浏览器登录）。`openid`/`profile` 只影响 id_token（我们从不读，`oid` 在 access token
+> 里本来就有），**已去掉**。`/mcp` 和 `/mcpproxy` 的**服务端校验要求完全相同**，reserved scope 纯属 client 请求侧的事。
 
 - **PKCE / state / client_id / redirect_uri 全部原样透传**：所以 PKCE 是 client↔Entra 端到端的，`state` 由 client 自己
   校验，回调直接回 client 的 loopback。

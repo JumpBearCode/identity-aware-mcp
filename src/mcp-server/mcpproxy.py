@@ -37,11 +37,13 @@ from starlette.routing import Route
 
 logger = logging.getLogger("dataops-mcp.mcpproxy")
 
-# Reserved OIDC scopes we always ensure are present on the upstream authorize
-# request: `offline_access` so Entra returns a refresh_token, `openid`/`profile`
-# so the id_token / user claims come back. They are allowed alongside a single
-# resource's scope in one Entra v2 request.
-_RESERVED_SCOPES = ("offline_access", "openid", "profile")
+# We ensure `offline_access` is on the upstream authorize request so Entra returns
+# a refresh_token — that lets the client silently renew the (~1h) access token
+# without another browser sign-in. `openid`/`profile` are intentionally NOT added:
+# this server validates the access token only and never reads an id_token, and
+# `oid` is present in the access token regardless. offline_access is allowed
+# alongside a single resource's scope in one Entra v2 request.
+_RESERVED_SCOPES = ("offline_access",)
 
 
 def _ensure_scopes(scope: str | None, api_scope: str) -> str:
