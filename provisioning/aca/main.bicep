@@ -65,6 +65,7 @@ module storage 'modules/storage.bicep' = {
   params: {
     name: name
     location: location
+    workspaceId: environment.outputs.workspaceId
   }
 }
 
@@ -78,13 +79,24 @@ module registry 'modules/registry.bicep' = {
   }
 }
 
-// --- Container Apps environment + Log Analytics ---
+// --- Container Apps environment + Log Analytics (+ MCPAudit_CL table) ---
 module environment 'modules/environment.bicep' = {
   name: 'environment'
   scope: rg
   params: {
     name: name
     location: location
+  }
+}
+
+// --- Audit facility: DCR (self ingestion endpoint) feeding MCPAudit_CL ---
+module audit 'modules/audit.bicep' = {
+  name: 'audit'
+  scope: rg
+  params: {
+    name: name
+    location: location
+    workspaceId: environment.outputs.workspaceId
   }
 }
 
@@ -127,6 +139,9 @@ module mcpApp 'modules/mcp-app.bicep' = {
     blobContainer: storage.outputs.blobContainerName
     blobContainerResourceId: storage.outputs.blobContainerResourceId
     sandboxImage: sandboxImage
+    auditDcrEndpoint: audit.outputs.dcrEndpoint
+    auditDcrImmutableId: audit.outputs.dcrImmutableId
+    auditStreamName: audit.outputs.streamName
   }
 }
 
@@ -142,6 +157,7 @@ module rbac 'modules/rbac.bicep' = {
     mcpPrincipalId: mcpApp.outputs.mcpPrincipalId
     diagnoseMiPrincipalId: sandboxGroups.outputs.diagnoseMiPrincipalId
     actionMiPrincipalId: sandboxGroups.outputs.actionMiPrincipalId
+    auditDcrName: audit.outputs.dcrName
   }
 }
 

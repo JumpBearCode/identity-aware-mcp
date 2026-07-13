@@ -14,3 +14,7 @@ azure-identity>=1.15
 azure-storage-blob>=12.19
 azure-mgmt-resource>=23.0
 azure-mgmt-authorization>=4.0
+
+# Audit sink (layer 1): ship structured tool-call audit rows to Log Analytics via
+# the Logs Ingestion API + DCR. Imported lazily; the local stdout path skips it.
+azure-monitor-ingestion>=1.0

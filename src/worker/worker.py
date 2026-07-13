@@ -40,6 +40,9 @@ TRUNCATE_HINT = (
 class ExecRequest(BaseModel):
     command: str
     timeout: float  # required; the MCP server is the single source of truth
+    # Correlation UA (docs/oid-log-tracking): set on the subprocess env below as
+    # AZURE_HTTP_USER_AGENT so `az` stamps it on every outgoing call's User-Agent.
+    user_agent: str | None = None
 
 
 def _cap(raw: bytes) -> tuple[str, bool]:
@@ -51,8 +54,15 @@ def _cap(raw: bytes) -> tuple[str, bool]:
 @app.post("/exec")
 async def exec_command(req: ExecRequest):
     logger.info("exec: %s", req.command)
+    # Set the correlation UA on the subprocess ENV (not in the command string) so
+    # a hostile command can't trivially rewrite it, and every `az` call inherits
+    # it as AZURE_HTTP_USER_AGENT. See docs/oid-log-tracking.
+    env = dict(os.environ)
+    if req.user_agent:
+        env["AZURE_HTTP_USER_AGENT"] = req.user_agent
     proc = await asyncio.create_subprocess_shell(
         req.command,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

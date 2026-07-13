@@ -22,6 +22,8 @@ from typing import Literal, Protocol, runtime_checkable
 
 import httpx
 
+from audit import build_user_agent
+
 logger = logging.getLogger("dataops-mcp.executor")
 
 Group = Literal["diagnose", "action"]
@@ -65,6 +67,7 @@ class SessionCtx:
     session_id: str | None
     conversation_id: str | None
     group: Group
+    correlation_id: str | None = None
 
 
 @runtime_checkable
@@ -94,14 +97,17 @@ class LocalDockerExecutor:
 
     async def exec(self, ctx: SessionCtx, command: str) -> ExecResult:
         worker_url = self._urls[ctx.group]
+        payload = {"command": command, "timeout": self._timeout - 10}
+        # Layer 2 (docs/oid-log-tracking): the worker sets this on the subprocess
+        # env as AZURE_HTTP_USER_AGENT, so `az` stamps it on every outgoing call's
+        # User-Agent — the join key from a native Azure log back to the audit row.
+        if ctx.correlation_id:
+            payload["user_agent"] = build_user_agent(ctx.correlation_id, ctx.user_oid)
         # httpx waits MCP_EXEC_TIMEOUT; the worker kills the subprocess 10s
         # earlier so a timeout comes back as a structured result, not a
         # ReadTimeout exception.
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            r = await client.post(
-                f"{worker_url}/exec",
-                json={"command": command, "timeout": self._timeout - 10},
-            )
+            r = await client.post(f"{worker_url}/exec", json=payload)
             r.raise_for_status()
             return ExecResult.from_worker_json(r.json())
 
