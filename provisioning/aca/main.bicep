@@ -79,7 +79,7 @@ module registry 'modules/registry.bicep' = {
   }
 }
 
-// --- Container Apps environment + Log Analytics (+ MCPAudit_CL table) ---
+// --- Container Apps environment + Log Analytics ---
 module environment 'modules/environment.bicep' = {
   name: 'environment'
   scope: rg
@@ -89,9 +89,9 @@ module environment 'modules/environment.bicep' = {
   }
 }
 
-// --- Audit facility: DCR (self ingestion endpoint) feeding MCPAudit_CL ---
-module audit 'modules/audit.bicep' = {
-  name: 'audit'
+// --- MCP observability (layer 1): MCPAudit_CL table + its Direct DCR ---
+module observability 'modules/mcp-observability.bicep' = {
+  name: 'observability'
   scope: rg
   params: {
     name: name
@@ -139,9 +139,9 @@ module mcpApp 'modules/mcp-app.bicep' = {
     blobContainer: storage.outputs.blobContainerName
     blobContainerResourceId: storage.outputs.blobContainerResourceId
     sandboxImage: sandboxImage
-    auditDcrEndpoint: audit.outputs.dcrEndpoint
-    auditDcrImmutableId: audit.outputs.dcrImmutableId
-    auditStreamName: audit.outputs.streamName
+    auditDcrEndpoint: observability.outputs.dcrEndpoint
+    auditDcrImmutableId: observability.outputs.dcrImmutableId
+    auditStreamName: observability.outputs.streamName
   }
 }
 
@@ -157,7 +157,7 @@ module rbac 'modules/rbac.bicep' = {
     mcpPrincipalId: mcpApp.outputs.mcpPrincipalId
     diagnoseMiPrincipalId: sandboxGroups.outputs.diagnoseMiPrincipalId
     actionMiPrincipalId: sandboxGroups.outputs.actionMiPrincipalId
-    auditDcrName: audit.outputs.dcrName
+    auditDcrName: observability.outputs.dcrName
   }
 }
 

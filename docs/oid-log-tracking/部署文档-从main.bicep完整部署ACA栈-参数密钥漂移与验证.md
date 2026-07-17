@@ -11,7 +11,7 @@ tags:
 status: 已按本文实测收敛部署成功（2026-07-13），main.bicep 为唯一真相来源
 sources:
   - "provisioning/aca/main.bicep（sub 作用域，一把起整栈）"
-  - "provisioning/aca/modules/{environment,audit,rbac,storage,mcp-app}.bicep"
+  - "provisioning/aca/modules/{environment,mcp-observability,rbac,storage,mcp-app}.bicep"
   - ".env.aca（云 profile，由 write-env.sh 生成）"
   - "实测：sub ee5f77a1-…, RG dataops-aca-rg, workspace dataops-aca-logs (4de6b3e7-…)"
 verified:

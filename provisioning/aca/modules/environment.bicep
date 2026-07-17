@@ -23,35 +23,6 @@ resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   }
 }
 
-// Custom table for the MCP per-tool-call audit rows (layer 1; docs/oid-log-tracking).
-// The DCR that feeds it lives in modules/audit.bicep.
-resource auditTable 'Microsoft.OperationalInsights/workspaces/tables@2023-09-01' = {
-  parent: logs
-  name: 'MCPAudit_CL'
-  properties: {
-    schema: {
-      name: 'MCPAudit_CL'
-      columns: [
-        { name: 'TimeGenerated', type: 'datetime' }
-        { name: 'correlation_id', type: 'string' }
-        { name: 'tool', type: 'string' }
-        { name: 'group', type: 'string' } // note: KQL keyword; query as ['group']
-        { name: 'user_oid', type: 'string' }
-        { name: 'user_upn', type: 'string' }
-        { name: 'client_ip', type: 'string' }
-        { name: 'session_id', type: 'string' }
-        { name: 'conversation_id', type: 'string' }
-        { name: 'command', type: 'string' }
-        { name: 'explanation', type: 'string' }
-        { name: 'sp_appid', type: 'string' }
-        { name: 'exit_code', type: 'int' }
-      ]
-    }
-    retentionInDays: 30
-    totalRetentionInDays: 30
-  }
-}
-
 resource env 'Microsoft.App/managedEnvironments@2024-03-01' = {
   name: '${name}-env'
   location: location

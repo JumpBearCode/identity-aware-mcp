@@ -1,6 +1,6 @@
 # SP 操作的用户归因:把共享 Service Principal 的每次 tool call 追回真人(文档索引)
 
-这个文件夹收录 **Identity-Aware MCP 的「用户归因 / OID 追踪」** 从"为什么共享 SP 模型丢了归因"到"在真实 ACA 上用一个 correlation id 把 MCP 审计表与原生 Azure 日志串起来、并沉淀成正式部署 runbook"的整条**设计与落地脉络**(对应 `oid-log` 分支,尚未并入 `main`)。核心实现:`src/mcp-server/audit.py` + `main.py`(middleware/`_exec`)+ `executor.py` / `worker.py` / `sandbox_manager.py` 的 UA 注入 + `provisioning/aca/modules/{audit,environment,rbac,storage,mcp-app}.bicep`(功能提交 `08d2f10`,退役 standalone `534dd09`)。
+这个文件夹收录 **Identity-Aware MCP 的「用户归因 / OID 追踪」** 从"为什么共享 SP 模型丢了归因"到"在真实 ACA 上用一个 correlation id 把 MCP 审计表与原生 Azure 日志串起来、并沉淀成正式部署 runbook"的整条**设计与落地脉络**(对应 `oid-log` 分支,尚未并入 `main`)。核心实现:`src/mcp-server/audit.py` + `main.py`(middleware/`_exec`)+ `executor.py` / `worker.py` / `sandbox_manager.py` 的 UA 注入 + `provisioning/aca/modules/{mcp-observability,environment,rbac,storage,mcp-app}.bicep`(功能提交 `08d2f10`,退役 standalone `534dd09`)。
 
 **一句话方案:** 权威归因由 MCP 服务端自己写一张 Log Analytics 表(层1),在原生日志里只留一把"钥匙"——注入到 User-Agent 的 correlation GUID(层2)——任何记 UA 的服务都能靠它 join 回权威表,把只显示"共享 SP + sandbox IP"的日志还原成"哪个真人、哪个 IP、哪一次调用"。
 
