@@ -55,10 +55,25 @@ param blobContainerResourceId string
 @description('Container image ref for the sandbox disk image (in ACR). Empty -> manager falls back to the public "ubuntu" disk.')
 param sandboxImage string = ''
 
+// --- audit (layer 1; docs/oid-log-tracking). Empty -> server falls back to stdout audit sink. ---
+param auditDcrEndpoint string = ''
+param auditDcrImmutableId string = ''
+param auditStreamName string = 'Custom-MCPAudit_CL'
+
+@description('Redis-backed distributed sandbox lock: "1" on, "0" off. Matches the live default.')
+param sandboxDistributedLock string = '0'
+
 var redisUrl = 'redis://${redisHost}:${redisPort}'
 // Deterministic public FQDN (matches ingress.fqdn) so the OAuth Protected
 // Resource Metadata advertises the real https URL, not localhost.
 var publicBaseUrl = 'https://${name}-mcp.${environmentDefaultDomain}'
+
+// Attach the ACR (with the app's system identity) only for a private azurecr.io
+// image. The cold-deploy placeholder is public, so this stays empty then and the
+// app can bootstrap before AcrPull (granted later in rbac.bicep). For an ACR image
+// it must be declared, else a redeploy drops the pull config (observed drift).
+var useAcrRegistry = contains(mcpImage, 'azurecr.io')
+var acrLoginServer = split(mcpImage, '/')[0]
 
 resource app 'Microsoft.App/containerApps@2024-03-01' = {
   name: '${name}-mcp'
@@ -75,6 +90,12 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
         transport: 'http'
         allowInsecure: false
       }
+      registries: useAcrRegistry ? [
+        {
+          identity: 'system'
+          server: acrLoginServer
+        }
+      ] : []
       secrets: [
         {
           name: 'mcp-client-secret'
@@ -113,6 +134,10 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'BLOB_CONTAINER', value: blobContainer }
             { name: 'BLOB_CONTAINER_RESOURCE_ID', value: blobContainerResourceId }
             { name: 'SANDBOX_DISK_IMAGE', value: sandboxImage }
+            { name: 'SANDBOX_DISTRIBUTED_LOCK', value: sandboxDistributedLock }
+            { name: 'AUDIT_DCR_ENDPOINT', value: auditDcrEndpoint }
+            { name: 'AUDIT_DCR_RULE_ID', value: auditDcrImmutableId }
+            { name: 'AUDIT_STREAM_NAME', value: auditStreamName }
           ]
         }
       ]

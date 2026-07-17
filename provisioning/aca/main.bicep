@@ -65,6 +65,7 @@ module storage 'modules/storage.bicep' = {
   params: {
     name: name
     location: location
+    workspaceId: environment.outputs.workspaceId
   }
 }
 
@@ -85,6 +86,17 @@ module environment 'modules/environment.bicep' = {
   params: {
     name: name
     location: location
+  }
+}
+
+// --- MCP observability (layer 1): MCPAudit_CL table + its Direct DCR ---
+module observability 'modules/mcp-observability.bicep' = {
+  name: 'observability'
+  scope: rg
+  params: {
+    name: name
+    location: location
+    workspaceId: environment.outputs.workspaceId
   }
 }
 
@@ -127,6 +139,9 @@ module mcpApp 'modules/mcp-app.bicep' = {
     blobContainer: storage.outputs.blobContainerName
     blobContainerResourceId: storage.outputs.blobContainerResourceId
     sandboxImage: sandboxImage
+    auditDcrEndpoint: observability.outputs.dcrEndpoint
+    auditDcrImmutableId: observability.outputs.dcrImmutableId
+    auditStreamName: observability.outputs.streamName
   }
 }
 
@@ -142,6 +157,7 @@ module rbac 'modules/rbac.bicep' = {
     mcpPrincipalId: mcpApp.outputs.mcpPrincipalId
     diagnoseMiPrincipalId: sandboxGroups.outputs.diagnoseMiPrincipalId
     actionMiPrincipalId: sandboxGroups.outputs.actionMiPrincipalId
+    auditDcrName: observability.outputs.dcrName
   }
 }
 

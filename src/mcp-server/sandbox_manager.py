@@ -35,6 +35,7 @@ from cache import (
     make_redis_client,
     RedisBackend,
 )
+from audit import build_user_agent
 from executor import ExecResult, Group, SessionCtx
 
 logger = logging.getLogger("dataops-mcp.sandbox")
@@ -515,10 +516,24 @@ class SandboxManager:
         q = shlex.quote(wd)
         return f"mkdir -p {q} && cd {q} && {{ {command}\n}}"
 
+    def _wrap(self, ctx: SessionCtx, command: str) -> str:
+        """Workspace scoping + layer-2 UA injection (docs/oid-log-tracking).
+
+        Each exec is a fresh shell, so we prepend `export AZURE_HTTP_USER_AGENT`
+        per call; `az` then stamps the correlation token on every outgoing call's
+        User-Agent. Best-effort (a command could `unset` it in the same shell) —
+        the authoritative record is the layer-1 audit row.
+        """
+        scoped = self._scope_to_workspace(ctx, command)
+        if not ctx.correlation_id:
+            return scoped
+        ua = build_user_agent(ctx.correlation_id, ctx.user_oid)
+        return f"export AZURE_HTTP_USER_AGENT={shlex.quote(ua)}\n{scoped}"
+
     async def exec(self, ctx: SessionCtx, command: str) -> ExecResult:
         self._ensure_reaper()
         client = await self.get_or_create(ctx)
-        result = await client.exec(self._scope_to_workspace(ctx, command))
+        result = await client.exec(self._wrap(ctx, command))
         stdout, t1 = _cap(result.stdout or "")
         stderr, t2 = _cap(result.stderr or "")
         if t1 or t2:

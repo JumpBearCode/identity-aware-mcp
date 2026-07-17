@@ -39,3 +39,4 @@ resource env 'Microsoft.App/managedEnvironments@2024-03-01' = {
 
 output environmentId string = env.id
 output environmentDefaultDomain string = env.properties.defaultDomain
+output workspaceId string = logs.id

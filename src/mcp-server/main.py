@@ -11,6 +11,7 @@ import logging
 import os
 
 import httpx
+import audit
 from cache import (
     GroupCache,
     InMemoryBackend,
@@ -151,14 +152,20 @@ class UserAuthMiddleware(Middleware):
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
         token = get_access_token()
-        oid = token.claims.get("oid") if token and hasattr(token, "claims") else None
+        claims = token.claims if token and hasattr(token, "claims") else {}
+        oid = claims.get("oid")
         fctx = context.fastmcp_context
         if fctx is not None:
             session_id, conversation_id = await _derive_ids(oid, fctx)
             await fctx.set_state("user_oid", oid)
             await fctx.set_state("session_id", session_id)
             await fctx.set_state("conversation_id", conversation_id)
-        logger.info("tool call by user_oid=%s tool=%s", oid, context.message.name)
+            # Attribution (docs/oid-log-tracking): mint a per-call correlation id
+            # (also injected into the worker's User-Agent, layer 2) plus the
+            # identity/ip that only exist at the ingress; _exec emits them.
+            await fctx.set_state("user_upn", claims.get("preferred_username") or claims.get("upn"))
+            await fctx.set_state("client_ip", audit.client_ip())
+            await fctx.set_state("correlation_id", audit.new_correlation_id())
         return await call_next(context)
 
 
@@ -181,15 +188,33 @@ async def _derive_ids(oid, fctx) -> tuple[str | None, str | None]:
 mcp = FastMCP("Azure DataOps", auth=auth, middleware=[UserAuthMiddleware()])
 
 
-async def _exec(group: str, command: str, ctx: Context):
+async def _exec(group: str, command: str, ctx: Context, explanation: str | None = None):
     """Build the routing context off stashed state and run on the backend."""
+    correlation_id = await ctx.get_state("correlation_id")
     sctx = SessionCtx(
         user_oid=await ctx.get_state("user_oid"),
         session_id=await ctx.get_state("session_id"),
         conversation_id=await ctx.get_state("conversation_id"),
         group=group,  # type: ignore[arg-type]
+        correlation_id=correlation_id,
     )
     result = await executor.exec(sctx, command)
+    # One structured audit row per tool call (replaces the old scattered
+    # logger.info lines). correlation_id joins this row to the native Azure log
+    # via the User-Agent the executor injects. Never blocks/fails the call.
+    await audit.get_audit_sink().record(audit.AuditEvent(
+        correlation_id=correlation_id,
+        tool=f"{group}_bash",
+        group=group,
+        user_oid=sctx.user_oid,
+        user_upn=await ctx.get_state("user_upn"),
+        client_ip=await ctx.get_state("client_ip"),
+        session_id=sctx.session_id,
+        conversation_id=sctx.conversation_id,
+        command=command,
+        explanation=explanation,
+        exit_code=result.exit_code,
+    ))
     return result.to_dict()
 
 
@@ -209,7 +234,6 @@ async def diagnose_bash(command: str, ctx: Context) -> dict:
     Keep work to Azure; running unrelated shell just burns tokens.
     Returns {exit_code, stdout, stderr}.
     """
-    logger.info("diagnose_bash: %s", command)
     return await _exec("diagnose", command, ctx)
 
 
@@ -241,14 +265,7 @@ async def action_bash(command: str, explanation: str, ctx: Context) -> dict:
 
     Returns {exit_code, stdout, stderr}.
     """
-    user_oid = await ctx.get_state("user_oid")
-    logger.info(
-        "action_bash: user=%s explanation=%s command=%s",
-        user_oid,
-        explanation,
-        command,
-    )
-    return await _exec("action", command, ctx)
+    return await _exec("action", command, ctx, explanation=explanation)
 
 
 @mcp.custom_route("/health", methods=["GET"])

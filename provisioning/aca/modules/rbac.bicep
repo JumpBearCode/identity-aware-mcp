@@ -32,10 +32,15 @@ param diagnoseMiPrincipalId string
 @description('Action sandbox-group MI principalId (for BYO blob volume auth).')
 param actionMiPrincipalId string
 
+@description('Audit DCR name (Monitoring Metrics Publisher target for the MCP MI).')
+param auditDcrName string
+
 // Built-in role definition ids.
 var sandboxGroupDataOwnerRoleId = 'c24cf47c-5077-412d-a19c-45202126392c'
 var storageBlobDataContributorRoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
 var acrPullRoleId = '7f951dda-4ed3-4680-a7ca-43fe172d538d'
+// Monitoring Metrics Publisher — the role the Logs Ingestion API requires on the DCR.
+var monitoringMetricsPublisherRoleId = '3913510d-42f4-4e42-8a64-420c390055eb'
 
 resource diagnoseGroup 'Microsoft.App/sandboxGroups@2026-02-01-preview' existing = {
   name: diagnoseGroupName
@@ -51,6 +56,21 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
 
 resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' existing = {
   name: registryName
+}
+
+resource auditDcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' existing = {
+  name: auditDcrName
+}
+
+// MCP MI publishes audit rows to the DCR via the Logs Ingestion API.
+resource metricsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(auditDcr.id, mcpPrincipalId, monitoringMetricsPublisherRoleId)
+  scope: auditDcr
+  properties: {
+    principalId: mcpPrincipalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', monitoringMetricsPublisherRoleId)
+    principalType: 'ServicePrincipal'
+  }
 }
 
 resource dataOwnerDiagnose 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
