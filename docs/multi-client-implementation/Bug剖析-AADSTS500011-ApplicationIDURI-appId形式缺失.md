@@ -8,7 +8,7 @@ tags:
   - identifier-uri
   - deploy-drift
   - bicep
-status: 已修复（2026-07-18：post-deploy 补回 api://<appId>，Claude Code Cloud MCP 重连成功）
+status: 方案A临时修复（2026-07-18 post-deploy 补 api://<appId>）；方案B根治已实现于分支 fix-identify-uri-overwrite（server 改广播友好名，待重部署验证）
 sources:
   - "src/mcp-server/mcpproxy.py（api_scope 构造，第 98 行）"
   - "src/mcp-server/main.py（AzureJWTVerifier / RemoteAuthProvider）"
@@ -76,7 +76,15 @@ sequenceDiagram
 
 ### 1.5 当前状态
 
-**已修复（2026-07-18）**：post-deploy 补回 `api://<appId>` 后，app 的 `identifierUris` 现为 `["api://88de6a37-…"]`，Claude Code Cloud MCP 重新授权成功。
+**方案 A（临时补丁，2026-07-18）**：post-deploy 补回 `api://<appId>` 后，app 的 `identifierUris` 曾为 `["api://88de6a37-…"]`，Claude Code Cloud MCP 重新授权成功。缺点见 §2.2（converge 静默复发）。
+
+**方案 B（根治，已实现于分支 `fix-identify-uri-overwrite`）**：改由 server 广播**友好名** `api://<name>-mcp-server` 作为 scope 前缀，让 Bicep 声明的 `identifierUris` 成为唯一真相，**删掉 post-deploy 补别名那步**。改动见 §3.1（6 处已全部落地 + Bicep 侧新增 `mcpIdentifierUri` output/env 把值喂给 server）。
+
+**已部署并验证（2026-07-18）**：`az acr build` 出新镜像 `mcp-server:identifier-uri-fix` → `az deployment sub create` converge（`name=dataops-aca`、`resourceGroupName=dataops-aca-rg`、`mcpClientSecret` 取自 live 不重置）→ Succeeded。验证结果：
+- app 的 `identifierUris` 由 `["api://88de6a37-…"]` **converge 成 `["api://dataops-aca-mcp-server"]`**（identity.bicep Graph）。
+- 容器滚到新镜像，env `MCP_IDENTIFIER_URI=api://dataops-aca-mcp-server`，OBO secret 未被重置（长度 40，非占位符）。
+- `/mcp` 与 `/mcpproxy` 的 protected-resource metadata `scopes_supported` 均为 `["api://dataops-aca-mcp-server/user_impersonation"]`——**广播的 scope 与 app 注册的 identifierUri 现已一致**（正是 500011 缺的那个对齐）。`/health` ok。
+- 剩余：真人在 Claude Code clear auth 走一遍交互式登录做端到端确认（metadata 与 identifierUri 已对齐，理论上不再 500011）。
 
 ---
 
@@ -127,7 +135,7 @@ az ad app update --id "$mcp_app_id" --identifier-uris "api://${mcp_app_id}"
 | # | 文件 / 位置 | 现在 | 改成 |
 |---|---|---|---|
 | 1 | `mcpproxy.py:98` | `api_scope = f"api://{mcp_app_id}/user_impersonation"` | 读友好名，如 `api_scope = f"{IDENTIFIER_URI}/user_impersonation"` |
-| 2 | `main.py` 的 `/mcp` 直连路径 | `AzureJWTVerifier(client_id=MCP_APP_ID, required_scopes=["user_impersonation"])` 由 FastMCP 内部按 `api://<client_id>` 广播 resource | 需让 RemoteAuthProvider/verifier 广播的 resource 用友好名——**要确认 FastMCP 是否支持覆盖 advertised resource**（可能需传自定义 resource/audience，或做库级定制） |
+| 2 | `main.py` 的 `/mcp` 直连路径 | `AzureJWTVerifier(client_id=MCP_APP_ID, required_scopes=["user_impersonation"])` 由 FastMCP 内部按 `api://<client_id>` 广播 resource | **已确认 FastMCP 原生支持**：`AzureJWTVerifier(..., identifier_uri=IDENTIFIER_URI)`。它的 `scopes_supported` 属性用 `identifier_uri` 拼前缀（进 `/mcp` protected-resource metadata），而 `audience=[client_id, identifier_uri]`——**GUID 形式的 `aud` 照样通过校验**（正是 §3.2），无需库级定制 |
 | 3 | server 配置 | 无 | 新增 env，如 `MCP_IDENTIFIER_URI=api://dataops-aca-mcp-server`，喂给 1、2 |
 | 4 | `opencode.json` | 写死 `"scope": "api://88de6a37-…/user_impersonation"` | 改成 `api://dataops-aca-mcp-server/user_impersonation` |
 | 5 | `tests/e2e_deployed.py` | `SCOPES = [f"api://{MCP_APP_ID}/user_impersonation"]` | 改成友好名 |
@@ -149,10 +157,10 @@ az ad app update --id "$mcp_app_id" --identifier-uris "api://${mcp_app_id}"
 
 | | 做法 | 代价 | 漂移 |
 |---|---|---|---|
-| **A（现状）** | 代码用 App ID，post-deploy 补别名 | 一行命令，但**每次 converge 必须重跑** | 会静默复发，靠纪律防 |
-| **B（改友好名）** | 代码用友好名，bicep 声明式拥有 | 改 §3.1 那 6 处 + 重验一次 | **结构上消除** |
+| **A（旧临时补丁）** | 代码用 App ID，post-deploy 补别名 | 一行命令，但**每次 converge 必须重跑** | 会静默复发，靠纪律防 |
+| **B（已采用 ✅）** | 代码用友好名，bicep 声明式拥有 | 改 §3.1 那 6 处 + 重验一次 | **结构上消除** |
 
-想立刻通用 A；想以后不再踩用 B。
+**已选 B**：§3.1 六处改动 + Bicep 侧 `mcpIdentifierUri` output/env 均已落地（分支 `fix-identify-uri-overwrite`），write-env.sh 的补别名步骤已删。剩下的只是重部署后跑一次 §1.5 的验证。
 
 ---
 

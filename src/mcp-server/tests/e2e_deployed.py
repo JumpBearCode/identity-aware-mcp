@@ -33,7 +33,9 @@ RUN
 CONFIG (env overrides; defaults target the current dev deployment)
   MCP_SERVER_URL         full /mcp URL of the deployed server
   AZURE_TENANT_ID        Entra tenant GUID
-  MCP_APP_ID             the MCP server's app (client) id -> scope api://<id>/user_impersonation
+  MCP_APP_ID             the MCP server's app (client) id (token aud / OBO)
+  MCP_IDENTIFIER_URI     the API's Application ID URI -> scope <uri>/user_impersonation
+                         (must match the server's MCP_IDENTIFIER_URI / app identifierUris)
   MCP_DEVICE_CLIENT_ID   a public client pre-authorized on the MCP API (default: VS Code)
 
 Exit code 0 = all checks passed, 1 = at least one failed.
@@ -60,7 +62,12 @@ MCP_APP_ID = os.environ.get("MCP_APP_ID", "88de6a37-cf75-40d3-83e8-44c5ccbc0895"
 # VS Code's first-party public client is pre-authorized on the MCP API, so the
 # device-code flow needs no consent screen. Override if you register your own.
 DEVICE_CLIENT_ID = os.environ.get("MCP_DEVICE_CLIENT_ID", "aebc6443-996d-45c2-90f0-388ff96faa56")
-SCOPES = [f"api://{MCP_APP_ID}/user_impersonation"]
+# The Application ID URI the server advertises as its OAuth scope prefix. Must be
+# a URI registered on the MCP app (Bicep: api://<name>-mcp-server) or Entra rejects
+# the resource lookup with AADSTS500011. The issued token's aud is still the appId
+# GUID, so MCP_APP_ID above is unchanged.
+IDENTIFIER_URI = os.environ.get("MCP_IDENTIFIER_URI", "api://dataops-aca-mcp-server")
+SCOPES = [f"{IDENTIFIER_URI}/user_impersonation"]
 CACHE_FILE = os.path.expanduser("~/.cache/aca-mcp-e2e/token_cache.json")
 
 # --------------------------------------------------------------------- checks

@@ -7,7 +7,7 @@
       "enabled": true,
       "oauth": {
         "clientId": "49af5fc1-96e6-40c1-b108-cb828cc2a00e",
-        "scope": "api://88de6a37-cf75-40d3-83e8-44c5ccbc0895/user_impersonation"
+        "scope": "api://dataops-aca-mcp-server/user_impersonation"
       }
     }
   },

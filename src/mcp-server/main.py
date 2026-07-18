@@ -40,6 +40,16 @@ DIAGNOSE_GROUP_ID = os.environ["DIAGNOSE_GROUP_ID"]
 ACTION_GROUP_ID = os.environ["ACTION_GROUP_ID"]
 BASE_URL = os.environ.get("MCP_SERVER_BASE_URL", "http://localhost:8080")
 
+# Application ID URI advertised as the OAuth scope prefix. Entra resolves a
+# client's requested resource by EXACT string match against the app's
+# identifierUris, so this must be a URI registered on the MCP app. Defaults to
+# api://<appId> (Entra's implicit default); deployments set it to the
+# Bicep-declared friendly name (api://<name>-mcp-server) so Bicep is the single
+# source of truth and no post-deploy identifier-uri patch is needed (that patch
+# was the AADSTS500011 drift — see docs Bug剖析-...500011). Token validation is
+# unaffected: AzureJWTVerifier accepts BOTH the appId GUID and this URI as `aud`.
+IDENTIFIER_URI = os.environ.get("MCP_IDENTIFIER_URI", f"api://{MCP_APP_ID}")
+
 # Plan A: expose a second /mcpproxy endpoint that strips the RFC 8707 `resource`
 # param before talking to Entra, so clients like Claude Code / opencode dodge
 # AADSTS9010010. /mcp (VS Code, direct-to-Entra) is left untouched. See mcpproxy.py
@@ -67,6 +77,10 @@ verifier = AzureJWTVerifier(
     client_id=MCP_APP_ID,
     tenant_id=TENANT_ID,
     required_scopes=["user_impersonation"],
+    # Advertise scopes as <IDENTIFIER_URI>/user_impersonation (scopes_supported in
+    # the /mcp protected-resource metadata). aud stays [MCP_APP_ID, IDENTIFIER_URI],
+    # so the appId-GUID token still validates unchanged.
+    identifier_uri=IDENTIFIER_URI,
 )
 auth = RemoteAuthProvider(
     token_verifier=verifier,
@@ -299,7 +313,7 @@ if MCPPROXY_ENABLED:
         mcp_path="/mcp",
         base_url=BASE_URL,
         tenant_id=TENANT_ID,
-        mcp_app_id=MCP_APP_ID,
+        identifier_uri=IDENTIFIER_URI,
         required_scopes=verifier.required_scopes,
     )
 
