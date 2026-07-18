@@ -115,6 +115,9 @@ as placeholders. Replace:
 * `<MCP_FQDN>` — your server host (local: `localhost:8081`; ACA: the app FQDN).
 * `<OAUTH_CLIENT_ID>` / `<MCP_APP_ID>` — printed by provisioning. `/mcpproxy` clients
   need them; VS Code needs neither (its built-in client is pre-authorized).
+* `<MCP_IDENTIFIER_URI>` — the API's Application ID URI (`api://<name>-mcp-server`),
+  printed by provisioning as `MCP_IDENTIFIER_URI`. This is the scope prefix clients
+  request; it must match what the server advertises (NOT the `api://<appId>` form).
 
 **Before you connect:** sign in as a user who is a member of `mcp-diagnose-users`
 (sees `diagnose_bash`) and/or `mcp-action-admins` (sees `action_bash`). Tool
@@ -168,7 +171,7 @@ Put this in `opencode.json`:
       "enabled": true,
       "oauth": {
         "clientId": "<OAUTH_CLIENT_ID>",
-        "scope": "api://<MCP_APP_ID>/user_impersonation"
+        "scope": "<MCP_IDENTIFIER_URI>/user_impersonation"
       }
     }
   },

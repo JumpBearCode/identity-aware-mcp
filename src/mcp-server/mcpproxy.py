@@ -81,7 +81,7 @@ def install_proxy_endpoint(
     mcp_path: str,
     base_url: str,
     tenant_id: str,
-    mcp_app_id: str,
+    identifier_uri: str,
     required_scopes: list[str],
     proxy_path: str = "/mcpproxy",
 ) -> None:
@@ -95,7 +95,11 @@ def install_proxy_endpoint(
     issuer = resource                          # our AS issuer == the resource URL
     authorize_ep = f"{resource}/authorize"
     token_ep = f"{resource}/token"
-    api_scope = f"api://{mcp_app_id}/user_impersonation"
+    # Advertise the scope under the app's Application ID URI. Must match a URI
+    # registered on the MCP app (identifierUris) or Entra rejects the client's
+    # resource lookup with AADSTS500011. Kept in lockstep with /mcp via the shared
+    # MCP_IDENTIFIER_URI (main.py). See docs Bug剖析-...500011.
+    api_scope = f"{identifier_uri}/user_impersonation"
 
     upstream_authorize = (
         f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/authorize"

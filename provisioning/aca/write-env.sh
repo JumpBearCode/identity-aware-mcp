@@ -20,16 +20,13 @@ outputs=$(az deployment sub show -n "$DEPLOYMENT_NAME" --query properties.output
 get() { jq -r --arg k "$1" 'to_entries[] | select((.key|ascii_upcase)==($k|ascii_upcase)) | .value.value' <<<"$outputs"; }
 
 redis_host=$(get REDIS_HOST)
-mcp_app_id=$(get MCP_APP_ID)
 
-# FastMCP advertises the OAuth scope as api://<appId>/user_impersonation, but
-# Bicep cannot self-reference the app's generated appId at create time, so
-# identity.bicep can only set a static Application ID URI. Add api://<appId> here
-# (post-deploy) or sign-in fails with AADSTS500011 "resource principal ... not
-# found". Idempotent.
-echo "==> Ensuring api://<appId> Application ID URI on the MCP app..."
-az ad app update --id "$mcp_app_id" --identifier-uris "api://${mcp_app_id}" \
-  --only-show-errors || echo "  (could not update identifier-uris; do it manually)"
+# NOTE: no post-deploy `az ad app update --identifier-uris` step here anymore.
+# The server advertises its scope under MCP_IDENTIFIER_URI (= the Bicep-declared
+# friendly URI api://<name>-mcp-server, set as a Container App env below), which
+# already matches the app's identifierUris. Bicep is the single source of truth,
+# so there is nothing left to patch — and the old overwrite was the AADSTS500011
+# drift (docs/multi-client-implementation/Bug剖析-AADSTS500011-...md).
 
 echo "==> Writing $ENV_OUT"
 cat > "$ENV_OUT" <<EOF
@@ -40,6 +37,7 @@ ACA_RESOURCE_GROUP=$(get RESOURCE_GROUP)
 ACA_REGION=$(get LOCATION)
 
 MCP_APP_ID=$(get MCP_APP_ID)
+MCP_IDENTIFIER_URI=$(get MCP_IDENTIFIER_URI)
 DIAGNOSE_GROUP_ID=$(get DIAGNOSE_GROUP_ID)
 ACTION_GROUP_ID=$(get ACTION_GROUP_ID)
 DIAGNOSE_SP_APP_ID=$(get DIAGNOSE_SP_APP_ID)

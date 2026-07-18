@@ -2,7 +2,8 @@
   // Identity-aware DataOps MCP server.
   // VS Code + GitHub Copilot discover Entra auth automatically:
   //   1. GET /mcp -> 401 with WWW-Authenticate -> resource metadata
-  //   2. metadata -> Entra tenant + scope api://<MCP_APP_ID>/user_impersonation
+  //   2. metadata -> Entra tenant + scope <MCP_IDENTIFIER_URI>/user_impersonation
+  //      (the app's Application ID URI, api://<name>-mcp-server; not api://<appId>)
   //   3. VS Code's built-in client (aebc6443-...) is pre-authorized, so PKCE
   //      sign-in needs no consent screen.
   // Sign in as a user who is a member of mcp-diagnose-users / mcp-action-admins

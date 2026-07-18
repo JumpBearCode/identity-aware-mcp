@@ -32,6 +32,9 @@ param mcpClientSecret string = ''
 // --- identity / auth ---
 param tenantId string
 param mcpAppId string
+
+@description('Application ID URI the server advertises as its OAuth scope prefix (MCP_IDENTIFIER_URI).')
+param mcpIdentifierUri string
 param diagnoseGroupId string
 param actionGroupId string
 
@@ -119,6 +122,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'MCP_SERVER_BASE_URL', value: publicBaseUrl }
             { name: 'AZURE_TENANT_ID', value: tenantId }
             { name: 'MCP_APP_ID', value: mcpAppId }
+            { name: 'MCP_IDENTIFIER_URI', value: mcpIdentifierUri }
             { name: 'MCP_CLIENT_SECRET', secretRef: 'mcp-client-secret' }
             { name: 'DIAGNOSE_GROUP_ID', value: diagnoseGroupId }
             { name: 'ACTION_GROUP_ID', value: actionGroupId }

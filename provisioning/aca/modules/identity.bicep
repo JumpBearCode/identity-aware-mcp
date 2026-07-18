@@ -48,9 +48,13 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
   uniqueName: '${name}-mcp-server'
   displayName: 'DataOps MCP Server (ACA)'
   signInAudience: 'AzureADMyOrg'
-  // Static URI only — Bicep can't reference this app's own generated appId at
-  // create time. FastMCP advertises the scope as api://<appId>/user_impersonation,
-  // so write-env.sh adds api://<appId> post-deploy (else sign-in -> AADSTS500011).
+  // The Application ID URI clients use to "name" this API when requesting a
+  // token. Bicep can't reference this app's own generated appId at create time,
+  // so we declare a static friendly URI and make the server advertise THIS as its
+  // OAuth scope prefix (mcpIdentifierUri output -> MCP_IDENTIFIER_URI env ->
+  // AzureJWTVerifier / mcpproxy). Bicep is the single source of truth; no
+  // post-deploy `az ad app update --identifier-uris api://<appId>` patch is needed
+  // (that overwrite was the AADSTS500011 drift — see docs Bug剖析-...500011).
   identifierUris: [
     'api://${name}-mcp-server'
   ]
@@ -179,6 +183,11 @@ resource actionSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
 }
 
 output mcpAppId string = mcpServerApp.appId
+// Application ID URI the server advertises as its OAuth scope prefix
+// (MCP_IDENTIFIER_URI). Clients request <this>/user_impersonation; the token's
+// aud is still the appId GUID. Matches identifierUris above — the friendly-name
+// source of truth that removes the AADSTS500011 post-deploy patch.
+output mcpIdentifierUri string = 'api://${name}-mcp-server'
 // Shared CLI public client appId — put into .mcp.json (Claude Code) and opencode.json.
 output cliClientAppId string = cliClientApp.appId
 output diagnoseGroupId string = diagnoseGroup.id
