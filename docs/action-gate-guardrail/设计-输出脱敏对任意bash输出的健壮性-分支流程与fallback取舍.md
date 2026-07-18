@@ -7,7 +7,7 @@ tags:
   - defense-in-depth
   - entropy
   - least-privilege
-status: 讨论中（2026-07-18：实测确认 non-pure-JSON 绕过，评估 fallback 方案）
+status: 已收敛（2026-07-18：本篇为推导过程；最终结论见「从输出脱敏到身份边界-认知收敛与Layer2终稿」）
 sources:
   - "src/mcp-server/redact.py（redact_result / _one / _mask_json / _CMD_VALUE_SCOPES）"
   - "src/mcp-server/main.py:206（_exec 里调用 redact_result）"
@@ -17,7 +17,7 @@ sources:
 # 设计：输出脱敏对任意 bash 输出的健壮性
 
 > 结论先行：**「按字段名打码」和「fallback 到熵检测」都不是银弹**。前者要求输出有结构（tsv/table/`--query value` 直接击穿），后者对低熵 secret 无能为力且有误杀。
-> 正确姿势是 **纵深防御**：JSON 片段提取 + scoped 命令上激进熵兜底 + **承认残余泄漏不可消除** → 真正的边界是**身份最小权限**（diagnose SP 本就该是 Reader、没有 secret get/list）。
+> 本篇是**推导过程**：从证伪结构派 / 熵法（§1–§7）到「确定性 + raw_decode 提取 + 删熵」的 v2 尝试（§8）。再往后的**认知拐点**——后置脱敏根本不是安全边界、边界应交给**身份最小权限**——单独成文：[从输出脱敏到身份边界-认知收敛与Layer2终稿.md](从输出脱敏到身份边界-认知收敛与Layer2终稿.md)。
 
 ---
 
@@ -254,3 +254,11 @@ flowchart TD
 - [ ] scope 兜底：in-scope 且整段不可解析 → wholesale mask（覆盖 tsv / 裸值 / echo 污染）。
 - [ ] 移除 `_shannon` / `_GUID` / `_HEX` / `_TOKEN` / `REDACT_ENTROPY` 相关代码。
 - [ ] 回归用例覆盖 §2 形态 1–8（不止一个 echo）+ in-scope tsv 裸值 + >64KB 截断。
+
+---
+
+> **认知拐点 →** §8 把这个擦除器打磨到了「确定性 + raw_decode 提取 + 删熵」的最稳形态。但下一步我们意识到：**再稳也没用**——只要调用方能塑形输出（藏命令躲 scope、改字段名躲字段法、`| base64` 重编码躲格式正则），后置脱敏就被绕过，**它本质不是安全边界**。
+>
+> 由此翻转出的最终架构（**身份最小权限做边界**、post-exec 退回 **Layer2-only 且只作用于 `action_bash`**）作为一次认知上的 progression 单独成文：
+>
+> **→ [从输出脱敏到身份边界-认知收敛与Layer2终稿.md](从输出脱敏到身份边界-认知收敛与Layer2终稿.md)**
