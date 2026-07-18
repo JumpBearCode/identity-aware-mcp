@@ -154,14 +154,25 @@ async def run() -> None:
             r4 = result_of(await s.call_tool("action_bash", {"command": f"echo {mark2}"}))
             check("action_bash runs (2nd group/sandbox)", r4.get("exit_code") == 0 and mark2 in r4.get("stdout", ""), f"exit={r4.get('exit_code')}")
 
-            # post-exec gate (redact.py): a secret-shaped value in tool output must be
-            # masked before it reaches the client. Uses a FAKE secret, never a real one.
-            secret = f"REDACTME-{uuid.uuid4().hex}"
-            cmd5 = "echo '{\"clientSecret\":\"" + secret + "\"}'"
-            r5 = result_of(await s.call_tool("diagnose_bash", {"command": cmd5}))
+            # post-exec Layer-2 hygiene (redact.py): a KNOWN-FORMAT secret in
+            # action_bash output must be masked before it reaches the client. Uses a
+            # FAKE secret, never a real one. Field-name masking is gone — Layer 2 keys
+            # off the VALUE FORMAT (here a connection-string AccountKey=<value>).
+            secret = f"REDACTME{uuid.uuid4().hex}=="
+            cmd5 = ("echo 'DefaultEndpointsProtocol=https;AccountName=foo;AccountKey="
+                    + secret + ";EndpointSuffix=core.windows.net'")
+            r5 = result_of(await s.call_tool("action_bash", {"command": cmd5}))
             out5 = r5.get("stdout", "")
-            check("post-exec redaction masks secrets",
+            check("post-exec redaction masks known-format secrets (action)",
                   secret not in out5 and "«redacted»" in out5, f"stdout={out5.strip()!r}")
+
+            # redaction is ACTION-ONLY: the same shape via diagnose_bash is NOT masked
+            # (diagnose relies on the identity boundary — zero data-plane — not on
+            # output scrubbing).
+            r6 = result_of(await s.call_tool("diagnose_bash", {"command": cmd5}))
+            out6 = r6.get("stdout", "")
+            check("diagnose_bash does not redact (action-only gate)",
+                  secret in out6 and "«redacted»" not in out6, f"stdout={out6.strip()!r}")
 
     passed = sum(1 for ok, *_ in _results if ok)
     total = len(_results)

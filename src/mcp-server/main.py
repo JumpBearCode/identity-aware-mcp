@@ -200,10 +200,11 @@ async def _exec(group: str, command: str, ctx: Context, explanation: str | None 
         correlation_id=correlation_id,
     )
     result = await executor.exec(sctx, command)
-    # Post-exec gate (docs/action-gate-guardrail/护栏落地方案-...md §2.1): mask any
-    # secret in the output before it leaves the server. Runs for BOTH diagnose and
-    # action (this is the shared path). Always REDACT — never blocks, never audits.
-    result = redact.redact_result(result, command=command)
+    # Post-exec Layer-2 hygiene : mask KNOWN-FORMAT secrets before output leaves the server.
+    # ACTION-ONLY — diagnose has no data-plane, so there is nothing to mask; the
+    # boundary is identity least-privilege, not this scrubber. Never blocks/audits.
+    if group == "action":
+        result = redact.redact_result(result)
     # One structured audit row per tool call (replaces the old scattered
     # logger.info lines). correlation_id joins this row to the native Azure log
     # via the User-Agent the executor injects. Never blocks/fails the call.
