@@ -126,8 +126,17 @@ async def run() -> None:
         async with ClientSession(r, w) as s:
             await s.initialize()
 
-            names = {t.name for t in (await s.list_tools()).tools}
+            tools = (await s.list_tools()).tools
+            names = {t.name for t in tools}
             check("tools exposed (auth + OBO + groups)", {"diagnose_bash", "action_bash"} <= names, f"got {sorted(names)}")
+
+            # action_bash must carry the forced-approval _meta (server-side). Verifies
+            # fastmcp passes anthropic/requiresUserInteraction through to the client —
+            # this is the signal Claude Code uses to force a human approval every call.
+            action_tool = next((t for t in tools if t.name == "action_bash"), None)
+            meta = (action_tool.model_dump(by_alias=True).get("_meta") or {}) if action_tool else {}
+            check("action_bash forces human approval (_meta)",
+                  meta.get("anthropic/requiresUserInteraction") is True, f"_meta={meta}")
 
             # 1st call: cold create + bootstrap + write a marker file into the sandbox
             r1 = result_of(await s.call_tool("diagnose_bash", {"command": f"echo {mark1} > /tmp/e2e_marker && echo {mark1}"}))
@@ -144,6 +153,15 @@ async def run() -> None:
             # the other tool / group
             r4 = result_of(await s.call_tool("action_bash", {"command": f"echo {mark2}"}))
             check("action_bash runs (2nd group/sandbox)", r4.get("exit_code") == 0 and mark2 in r4.get("stdout", ""), f"exit={r4.get('exit_code')}")
+
+            # post-exec gate (redact.py): a secret-shaped value in tool output must be
+            # masked before it reaches the client. Uses a FAKE secret, never a real one.
+            secret = f"REDACTME-{uuid.uuid4().hex}"
+            cmd5 = "echo '{\"clientSecret\":\"" + secret + "\"}'"
+            r5 = result_of(await s.call_tool("diagnose_bash", {"command": cmd5}))
+            out5 = r5.get("stdout", "")
+            check("post-exec redaction masks secrets",
+                  secret not in out5 and "«redacted»" in out5, f"stdout={out5.strip()!r}")
 
     passed = sum(1 for ok, *_ in _results if ok)
     total = len(_results)

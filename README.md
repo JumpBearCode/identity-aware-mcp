@@ -75,6 +75,36 @@ az deployment sub create -n dataops-mcp-aca -l westus2 -f main.bicep
 #       point your client at https://<MCP_FQDN>/mcp
 ```
 
+## Connect a client (with forced human approval)
+
+`action_bash` writes to Azure, so every call must be approved by a human. The
+enforcement is layered — a server-side declaration plus per-client settings this
+repo ships ready to use.
+
+**Server side (always on, no client config needed).** `action_bash` is tagged with
+`_meta["anthropic/requiresUserInteraction"]=true` in `src/mcp-server/main.py`.
+Claude Code honors this and forces approval on every call (even a
+`--permission-prompt-tool` "allow" becomes "deny"). Other clients ignore `_meta`
+and enforce via their own settings below.
+
+**Client config (already in this repo).** Point the client at the MCP server, then
+the shipped approval settings apply:
+
+| Client | Server registration | Approval settings | Note |
+|---|---|---|---|
+| **Claude Code** | `.mcp.json` | `.claude/settings.json` (`ask` on action_bash) | Server `_meta` already forces it; `ask` is belt-and-suspenders |
+| **VS Code** | `.vscode/mcp.json` | `.vscode/settings.json` (`chat.tools.autoApprove:false`) | Per-tool lock `eligibleForAutoApproval` — key name is VS Code-version-sensitive, verify before relying on it |
+| **opencode** | `opencode.json` (`mcp`) | `opencode.json` (`permission`) | Weak link: no server-side force, no org lock — verify the tool id |
+
+**Fleet lockdown (so a user/operator can't turn it off).** Deploy Claude Code
+`managed-settings.json` with `disableBypassPermissionsMode:"disable"`, and push the
+VS Code settings via MDM. The exact blocks + rationale are in
+[`docs/action-gate-guardrail/护栏落地方案-输出脱敏与client强制审批.md`](docs/action-gate-guardrail/护栏落地方案-输出脱敏与client强制审批.md)
+§2.2.
+
+Tool output is also scanned for secrets before it reaches the client (both tools);
+see the same doc §2.1 and `src/mcp-server/redact.py`.
+
 ## Layout
 
 | Path | What |

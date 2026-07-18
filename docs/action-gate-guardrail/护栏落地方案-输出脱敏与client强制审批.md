@@ -61,7 +61,7 @@ sources:
 
 - **`explanation` 还没进 `SessionCtx`、没到 `executor.exec`**：`_exec` 收到了 `explanation`（给审计用），但 `SessionCtx` 里没有该字段、`exec(ctx, command)` 也拿不到。pre-exec 要做「意图 vs 命令」比对，需要补这最后一跳。
 - **`action_bash` 还没设 `requiresUserInteraction`**：目前只有 `annotations={readOnlyHint:false, destructiveHint:true, ...}`——而 annotations 是 hint 不是闸门，client 没义务因它弹窗。强制审批的那行 `_meta` 还没加。
-- **没有任何 gate**：`GatedExecutor` / pipeline / 脱敏规则都还不存在。`_exec` 目前是 `build SessionCtx → executor.exec → 写审计`，中间没有 pre/post 处理。
+- **gate 现状**：post-exec 脱敏（`redact.py`）**本迭代已落地**并接进 `_exec`（diagnose + action 共走）；pre-exec pipeline（Part 3）、`GatedExecutor` 可选封装尚未做。
 
 ### 1.3 本迭代的收敛边界
 
@@ -106,9 +106,48 @@ flowchart TD
 - **③ entropy 兜底**：只在 key-ish 位置（敏感变量赋值、连接串 `=` 后、敏感 JSON key 的 value）触发，压误报。
 - **④ Presidio（可选）**：PII 才用，secret 别指望它。依赖重就放 **同 ACA app 的 sidecar 容器**（localhost 调用、依赖隔离）。
 
-**verdict**：`REDACT`（掩码后放行，默认）或 `BLOCK`（validation 模式，检出即拦）。verdict + 命中的规则名写进 `AuditEvent`（见 2.3）。
+**verdict：只有 REDACT —— 不 BLOCK、不审批、不进审计。** 命令已经跑完、secret 已经在输出里，post-exec 唯一的活是「别把它吐出去」，没有可审批的东西；而「每次都跑脱敏」是默认路径，记 verdict 只是噪音。所以脱敏就是 `ExecResult → 脱敏后的 ExecResult` 一个纯变换：不返回 verdict、不拦整条输出（BLOCK 会把 secret 周围有用的输出也一起丢掉，对 DataOps 太难用）。命中数只 `logger.debug` 记**条数（不记值）**供调 FP 用，不进 `AuditEvent`（见 2.3）。
 
-**范围提示**：privileged secret 读走 `action_bash`；`diagnose`（Reader）本就读不到多数 secret（KV secret 值是数据面、`listKeys` 家族是控制面 action，Reader 都没有）。所以脱敏对 **action 路径**最关键，diagnose 路径挂个轻量兜底即可。
+**两条路都走同一个 gate**：`diagnose_bash` 和 `action_bash` 都经 `main.py:_exec`，脱敏挂在这一处、两个 tool 自动覆盖——代码就是 `_exec` 里 `result = redact.redact_result(result, command=command)`。虽然 action 路径最关键（privileged secret 读走 action、`diagnose` 的 Reader 本就读不到多数 secret），但 diagnose 也照走：一致、纵深，且 Reader 偶尔能读到的敏感串（某些资源属性里嵌的连接串）也被兜住。
+
+#### 2.1.1 detect-secrets 是什么
+
+Yelp 开源的 secret 扫描工具/库，最初为「阻止 secret 被 commit 进 git」（pre-commit hook）而生。对我们有用的是它两块能力：
+
+- **检测器（plugins）**：① 已知格式——AWS/Azure Storage key、JWT、Basic Auth、私钥、各家 token…；② `KeywordDetector`——按变量名（`password`/`secret`/`api_key`）抓值；③ **熵检测器**——`Base64HighEntropyString` / `HexHighEntropyString`，Shannon 熵可调阈值。
+- **误报过滤器（filters）——这才是它对我们最值钱的部分**：一批久经考验的 FP 排除器，直接抵消熵检测的噪音：`is_potential_uuid`（GUID 不算 secret）、`is_sequential_string`（`1234abcd`）、`is_likely_id_string`、`is_templated_secret`（`<password>` / `${VAR}` / `xxxxx` / `example`）、`is_lock_file`…
+
+怎么当库用（注意它主要为 git 场景设计——报「有没有 secret + 类型/行号」）：做**脱敏**要拿到匹配 span，扫描态下 `PotentialSecret.secret_value` 可得，`text.replace(secret_value, MASK)` 即可。**更适合脱敏的其实是 gitleaks**：每条规则是一个带 capture group 的正则，capture group 就是要掩的精确 span。
+
+我们的用法：**主力是自己写的 JSON 按 key 脱值**（你控制 `-o json`，精度最高）；detect-secrets / gitleaks 的价值是复用它们**成熟的已知格式正则包 + 熵检测器 + FP 过滤器**，不用手攒、不用自己趟 FP 的坑。`redact.py` 现在内置了最关键的几条（JWT/PEM/SAS/连接串/storage key）；要扩就把 gitleaks 规则灌进 `_KNOWN`、把 detect-secrets 的 filters 灌进熵通道。
+
+#### 2.1.2 实现细节（`redact.py`，已落地）
+
+落点：`_exec` 里 `executor.exec` 之后、返回之前，`redact.redact_result(result, command=command)`；`ExecResult` 是 frozen dataclass，用 `dataclasses.replace` 造新结果。三层对应代码：
+
+1. **JSON 按 key 脱值（`_mask_json`）**：`json.loads(stdout)` 成功就递归走；key 命中 `_SENSITIVE_KEY`（**只放不歧义的复合名**：`password`/`clientSecret`/`connectionString`/`accountKey`/`primaryKey`/`accessToken`…）就把**标量值**换成 `«redacted»`。**只掩标量**，绝不把值是 list/dict 的字段替掉（防 `{"value":[...]}` 被端）。解析失败（`-o table`/`tsv`/stderr）跳过本层。
+2. **已知格式正则（`_KNOWN`）**：JWT / PEM / `bearer …` / SAS `sig=` / 连接串 `AccountKey=…` / 88 字符 storage key。`group>0` 的只掩值、保留标签（`sig=«redacted»`）。JSON 重序列化后也再跑一遍，抓「藏在非敏感字段里的连接串」。
+3. **熵兜底（`_redact_text` 的 entropy 分支）**：**默认关**（`REDACT_ENTROPY=1` 才开）；即便开，也先过 GUID/hex 允许清单，再按 Shannon 熵阈值（默认 4.2）+ 最小长度判。
+
+命令域的 `value`/`key`：`_CMD_VALUE_SCOPES` 认出 `keyvault secret show`、`* keys list` 这类「命令目的就是吐 secret」的，**才**允许掩歧义的 `value`/`key`；否则 `value`/`key` 一律不碰（tag、list wrapper 保命）。stdout / stderr 两个出口都脱（错误里也会回显连接串）。
+
+验收：`tests` 里 8 个用例覆盖上述每种情况（含 `group list` 不误伤、tag `key/value` 保留、GUID 保留 3 个 FP 用例），全绿。
+
+> **逐层流程图、每层 before/after 例子、端到端走查**见 [`输出脱敏实现详解-redact三层逻辑与示例`](输出脱敏实现详解-redact三层逻辑与示例.md)。
+
+#### 2.1.3 把 false positive 降到忽略不计
+
+精确层（JSON key + 已知格式 + 命令域）≈0 FP 且干了绝大部分活；**熵是唯一 FP 源**，所以要么关掉、要么用允许清单 + 上下文压到忽略不计。七条手段：
+
+1. **优先高精度、把熵网做到最小甚至关掉**：JSON 按 key（键名触发，≈100% 精度）+ 已知格式（`eyJ` / `-----BEGIN` / `sig=` 前缀，≈100%）几乎不误报。只靠这两层 FP 已近零——`redact.py` 默认就是这个配置（熵关）。
+2. **歧义键名不进通用集**：`value`/`key`/`token`/`secret` 太常见（tag、`{"value":[...]}` list wrapper、storage 的 `keyName`），**一律不放进 `_SENSITIVE_KEY`**，只在命令域内掩。这是最容易踩的 over-redaction 坑（`az … list` 会被整个端掉）。
+3. **只掩标量**：`_mask_json` 绝不把值是 list/dict 的字段替成 MASK，防端掉整个结果数组。
+4. **标识符允许清单**：GUID（订阅/租户/资源 id）、hex/sha（git sha、镜像 digest）、resource id 明确排除——掩了它们不只是 FP，还会**打断 agent 下一步**（下一条命令要用那个 id）。detect-secrets 的 `is_potential_uuid` 等 filters 就是干这个，开熵通道时直接复用。
+5. **熵：上下文门控 + 保守阈值 + 最小长度**：开熵时只在 key-ish 位置触发、阈值取高（宁漏不误）、要求 ≥20 字符。漏掉的高熵 secret 由 L0 RBAC + L3 审计兜底——**用熵的 FN 换 FP→0**。
+6. **命令域精准打击**：认出命令就外科手术式只掩该命令的 secret 字段（`keyvault secret show → .value`），精度≈100%，优先于任何盲扫。
+7. **可观测可调**：命中只记条数（`logger.debug`，不记值），便于发现 over-redaction 回调规则；掩码保留标签（`sig=«redacted»`）便于 debug。
+
+> 一句话：**精确层负责召回、熵默认关、歧义键名与标识符明确排除** → FP 实际为 0，真正漏的那点交给 RBAC + 审计。
 
 ### 2.2 第二部分：client 端强制人工审批（Human-in-the-Loop）
 
@@ -120,68 +159,135 @@ flowchart TD
 | **VS Code** | `chat.tools.eligibleForAutoApproval:{"<toolId>":false}` | **client 设置（MDM/组织策略下发）** | server **传不了强制信号**，只能传 annotations 当 hint（`readOnlyHint:false`/`destructiveHint:true`）+ 稳定 toolId | ✅ 仅靠 MDM/组织策略 |
 | **opencode** | 仅 `permission:{tool:"ask"}` | client 配置 | 无 server 端强制、无 elicitation | ❌ 无锁、无 server 强制 —— **弱链** |
 
-#### Claude Code —— server 端一行 + fleet 锁
+> ⚠️ 下面的版本号 / 设置键名来自前一轮 multi-client 调研，client 侧设置一直在演进——**落地前按团队实际 client 版本核对**（尤其 VS Code 的键名）。
+>
+> 📁 **本仓库已内置可用配置**，clone 后照 [`README` 的 "Connect a client"](../../README.md) 即可 set up：server 端 `_meta` 已在 `src/mcp-server/main.py` 的 `action_bash` 上；client 配置见根目录 `.mcp.json`（Claude Code）、`.vscode/mcp.json` + `.vscode/settings.json`（VS Code）、`opencode.json`（opencode）、`.claude/settings.json`（Claude Code 审批）。下面是**说明层（保留）**，真实 server 名是 `azure-dataops-aca`，示例里的占位名以仓库文件为准。
 
-server（FastMCP）在 `action_bash` 的 tool 定义上加：
+#### Claude Code —— server 端一行 `_meta` + fleet 锁
+
+**① server（FastMCP）在 `action_bash` 的 tool 定义上加强制信号**（这是主力，一处声明全局强制）：
 
 ```python
 @mcp.tool(
     auth=require_action,
     annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
-    meta={"anthropic/requiresUserInteraction": True},   # ← 这一行是给 Claude Code 的强制信号
+    meta={"anthropic/requiresUserInteraction": True},   # ← 给 Claude Code 的强制信号（v2.1.199+）
 )
 async def action_bash(command: str, explanation: str, ctx: Context) -> dict:
     ...
 ```
 
-设了之后 Claude Code **每次** `action_bash` 都强制真人交互，连 `--permission-prompt-tool` 的 `allow` 都会被转成 `deny`（「prompt 必须到达一个人」）。再叠 managed settings 锁死不让 operator 开 YOLO：
+设了之后 Claude Code **每次** `action_bash` 都强制真人交互，连 `--permission-prompt-tool` 的 `allow` 都会被转成 `deny`（「prompt 必须到达一个人」）。
+
+**② MCP server 注册**（`.mcp.json`）——server 名 `dataops` 决定权限 id 前缀 `mcp__dataops__`：
 
 ```jsonc
-// Claude Code managed settings（团队机器下发）
+// .mcp.json（项目根）
 {
-  "permissions": {
-    "allow": ["mcp__dataops__diagnose_bash"],
-    "ask":   ["mcp__dataops__action_bash"],
-    "disableBypassPermissionsMode": "disable"
+  "mcpServers": {
+    "dataops": {
+      "type": "http",
+      "url": "https://mcp.example.internal/mcp"
+    }
   }
 }
 ```
 
-#### VS Code —— server 只给 hint，锁靠 MDM
-
-server 端**没有**等价的「强制交互」meta；`annotations` 只是 hint。真正的强制靠 client 侧设置，由 MDM/组织策略下发、用户改不了：
+**③ managed settings 锁死**——企业管控层，用户 / operator 改不了，优先级高于用户与项目设置：
 
 ```jsonc
-// VS Code —— 组织级 / MDM 下发
-{ "chat.tools.eligibleForAutoApproval": { "<action_bash tool id>": false } }
+// managed-settings.json（企业下发；用户无法覆盖）
+//   macOS:   /Library/Application Support/ClaudeCode/managed-settings.json
+//   Linux:   /etc/claude-code/managed-settings.json
+//   Windows: C:\ProgramData\ClaudeCode\managed-settings.json
+{
+  "permissions": {
+    "allow": ["mcp__dataops__diagnose_bash"],
+    "ask":   ["mcp__dataops__action_bash"],
+    "deny":  [],
+    "defaultMode": "default"
+  },
+  "disableBypassPermissionsMode": "disable",   // ← 顶层键, 不在 permissions 内; 封死 YOLO / bypass 模式
+  "enableAllProjectMcpServers": true            // 可选: 强制启用项目 MCP server, 免得用户不接
+}
 ```
 
-所以对 VS Code，server 的职责是：**稳定的 tool id + 诚实的 annotations**；强制那一环交给管设备的人。
+> 结构要点：`disableBypassPermissionsMode` 是 **settings 顶层键**（不是 `permissions` 的子键）；`ask` 是审批的兜底，真正的强制来自 server 端 `_meta`。
+
+#### VS Code —— server 只给 hint，锁靠 client 设置 + MDM
+
+server 端**没有**等价的「强制交互」meta；`annotations` 只是 hint。真正的强制靠 client 侧设置，由 MDM/组织策略下发、用户改不了。
+
+**① MCP server 注册**（`.vscode/mcp.json`，注意 VS Code 用 `servers` 不是 `mcpServers`）：
+
+```jsonc
+// .vscode/mcp.json
+{
+  "servers": {
+    "dataops": {
+      "type": "http",
+      "url": "https://mcp.example.internal/mcp"
+    }
+  }
+}
+```
+
+**② 审批设置**（`settings.json`，组织级 / MDM 下发）：
+
+```jsonc
+// settings.json（企业策略下发, 用户改不了）
+{
+  // 先关掉全局自动放行（默认就是 false, 显式写死防被人开）
+  "chat.tools.autoApprove": false,
+
+  // 细粒度: 让 action_bash 永不进入自动放行（每次强制弹框, 连"始终允许"也不给记住）
+  //   键名 / tool id 形状随 VS Code 版本演进, 落地前核对（见本节顶部 ⚠️）
+  "chat.tools.eligibleForAutoApproval": {
+    "dataops/action_bash": false
+  }
+}
+```
+
+> 机制要点：只设 `autoApprove:false` 不够——VS Code 会记住用户点过的「始终允许」，之后就不再弹了。要**永远弹**必须用 `eligibleForAutoApproval:false`（禁止该 tool 被记住/自动放行），并**由 MDM 锁死**让用户改不回来。所以对 VS Code，server 的职责是：**稳定的 tool id + 诚实的 annotations**；强制那一环交给管设备的人。
 
 #### opencode 是怎么回事
 
-opencode 目前：**无 server 端强制交互、无 elicitation（FR #8251 / #23066 仍未支持）、无企业级锁**，只有 client 本地的 `permission:{tool:"ask"}`，operator 能自行改掉。
+opencode 目前：**无 server 端强制交互、无 elicitation（FR #8251 / #23066 仍未支持）、无企业级锁**，只有 client 本地的 `permission`，operator 能自行改掉。
 
 ```jsonc
-// opencode —— 弱链，尽力而为
-{ "permission": { "dataops_diagnose_bash": "allow", "dataops_action_bash": "ask" } }
+// opencode.json（项目根 / ~/.config/opencode/config.json）
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "dataops": {
+      "type": "remote",
+      "url": "https://mcp.example.internal/mcp",
+      "enabled": true
+    }
+  },
+  "permission": {
+    "dataops_diagnose_bash": "allow",
+    "dataops_action_bash": "ask"   // 唯一能做的; operator 可自行改掉, 无锁
+  }
+}
 ```
 
 **取舍**：opencode 是弱链。高危操作要么**限制只允许 Claude Code / VS Code 接入**，要么把「opencode 仅走 `ask` + 组织约定」作为**残余风险显式接受**（RBAC 地板仍在，爆炸半径有上限）。别把它当可靠的强制点。
 
-### 2.3 两部分如何进同一条审计链
+### 2.3 什么进审计、什么不进
 
-`_exec` 已经每次写一条 `AuditEvent`。给它加 gate 字段，让「谁、哪条命令、gate 判了什么」在一行里可查：
+- **post-exec 脱敏不进审计**：它是每次都跑的默认行为，记 verdict 只是噪音。命中数走 `logger.debug`（不记值）仅供调 FP，不进 `AuditEvent`。
+- **只有 pre-exec 的决策才进审计**（Part 3 落地时）：`BLOCK`、人工审批结果这类真正的安全事件才值得留痕。届时给 `AuditEvent` 加：
 
 ```python
-# audit.py: AuditEvent 增补字段
-gate_verdict: str | None = None     # ALLOW / BLOCK / NEEDS_APPROVAL / REDACT
+# audit.py: AuditEvent 增补字段（Part 3 落地时，非本迭代）
+gate_verdict: str | None = None     # ALLOW / BLOCK / NEEDS_APPROVAL
 gate_rule:    str | None = None     # 命中的规则名
 risk_note:    str | None = None     # 给人看的风险标注
 approved_by_human: bool | None = None   # elicitation/审批结果（如可得）
 ```
 
-> 一次 tool call 仍是**一条权威行**：gate 把 verdict 塞回 `_exec`，由 `_exec` 那一行带出，而不是 gate 自己另写一行（避免每次两行）。
+> 一次 tool call 仍是**一条权威行**：pre-exec verdict 塞回 `_exec`，由 `_exec` 那一行带出，而不是另写一行。
 
 ---
 
@@ -321,10 +427,10 @@ flowchart LR
 
 | # | 任务 | 文件 | 验收 |
 |---|---|---|---|
-| 1 | `action_bash` 加 `meta={"anthropic/requiresUserInteraction": True}` | `main.py` | Claude Code 上 action_bash 每次强制弹审批 |
-| 2 | Claude Code managed settings + `disableBypassPermissionsMode`；VS Code MDM 下发 `eligibleForAutoApproval:false` | 运维/MDM | operator 无法绕过（Claude Code / VS Code）；opencode 记为残余风险 |
-| 3 | post-exec 脱敏：已知格式正则（嵌 `detect-secrets`）+ JSON 按 key 脱值 + entropy 兜底 | 新增 `gate/redact.py`；`_exec` 调用 | `az keyvault secret show` / `storage account keys list` 输出的 secret 被掩码 |
-| 4 | `AuditEvent` 加 `gate_verdict/gate_rule/risk_note` 并在 `_exec` 写入 | `audit.py`、`main.py` | 一行审计含 gate 结论 |
+| 1 | ✅ **代码已落地（待端到端验证）**：`action_bash` 加 `meta={"anthropic/requiresUserInteraction": True}`；仓库并附各 client 配置（`.mcp.json` / `.vscode/*` / `opencode.json` / `.claude/settings.json`） | `main.py` + 仓库 client 配置 | 代码在位；「每次强制弹审批」需真实 Claude Code 跑一次确认（含 fastmcp `_meta` 是否原样透出） |
+| 2 | ⬜ **未做，本质是运维/MDM 动作**：企业级 `managed-settings.json` + `disableBypassPermissionsMode:"disable"`、VS Code 经 MDM 下发 `eligibleForAutoApproval:false`。⚠️ 仓库里已提交的是**可被覆盖的默认值**（`.claude/settings.json` 的 `ask`、`.vscode/settings.json` 的 `autoApprove`），**不是锁** | 运维/MDM | operator/用户无法绕过（Claude Code / VS Code）；opencode 记为残余风险 |
+| 3 | ✅ **已实现** post-exec 脱敏：JSON 按 key 脱值 + 已知格式正则 + 命令域 `value` + 熵（默认关）；diagnose+action 共走 | `redact.py`、`main.py:_exec` | 8 用例全绿；secret 掩码，`group list`/tag/GUID 不误伤 |
+| 4 | （改归 Part 3）**pre-exec** verdict 进审计：`AuditEvent` 加 `gate_verdict/rule/risk_note`。**post-exec 脱敏不进审计** | `audit.py`、`main.py` | pre-exec BLOCK/审批留痕 |
 | 5 |（衔接 Part 3）`SessionCtx` 加 `explanation` 并透传 | `executor.py`、`main.py` | explanation 到达执行层，为 pre-exec 备料 |
 
 > 顺序：先 1+2（client 强制审批，改动最小、立刻见效）→ 3+4（输出脱敏 + 审计留痕）→ 5（为 Part 3 铺路）。

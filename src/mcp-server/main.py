@@ -12,6 +12,7 @@ import os
 
 import httpx
 import audit
+import redact
 from cache import (
     GroupCache,
     InMemoryBackend,
@@ -199,6 +200,10 @@ async def _exec(group: str, command: str, ctx: Context, explanation: str | None 
         correlation_id=correlation_id,
     )
     result = await executor.exec(sctx, command)
+    # Post-exec gate (docs/action-gate-guardrail/护栏落地方案-...md §2.1): mask any
+    # secret in the output before it leaves the server. Runs for BOTH diagnose and
+    # action (this is the shared path). Always REDACT — never blocks, never audits.
+    result = redact.redact_result(result, command=command)
     # One structured audit row per tool call (replaces the old scattered
     # logger.info lines). correlation_id joins this row to the native Azure log
     # via the User-Agent the executor injects. Never blocks/fails the call.
@@ -245,6 +250,12 @@ async def diagnose_bash(command: str, ctx: Context) -> dict:
         "idempotentHint": False,
         "openWorldHint": True,
     },
+    # Force a human approval on every action_bash call (docs/action-gate-guardrail
+    # §2.2). Claude Code honors this _meta and turns even a --permission-prompt-tool
+    # "allow" into "deny". Other clients ignore _meta and enforce via their own
+    # settings (see README "Connect a client"). Verify end-to-end per client version
+    # (Claude Code v2.1.199+; confirm _meta passes through your fastmcp build).
+    meta={"anthropic/requiresUserInteraction": True},
 )
 async def action_bash(command: str, explanation: str, ctx: Context) -> dict:
     """Run a write/modify shell command for Azure operations.
