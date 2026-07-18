@@ -1,0 +1,14 @@
+{
+  // Force human approval on the write tool. `action_bash` writes to Azure, so it
+  // must never run without a person clicking approve. See README "Connect a client"
+  // and docs/action-gate-guardrail/护栏落地方案-输出脱敏与client强制审批.md §2.2.
+
+  // Solid: turn off blanket auto-approve so tools prompt.
+  "chat.tools.autoApprove": false
+
+  // Per-tool lock so action_bash can never be remembered as "always allow".
+  // NOTE: the key name / tool-id shape is VS Code-version-sensitive — verify
+  // against your VS Code build before relying on it, then push via MDM so users
+  // can't change it back.
+  // "chat.tools.eligibleForAutoApproval": { "azure-dataops-aca/action_bash": false }
+}

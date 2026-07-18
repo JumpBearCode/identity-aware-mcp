@@ -1,0 +1,6 @@
+{
+  "permissions": {
+    "allow": ["mcp__azure-dataops-aca__diagnose_bash"],
+    "ask": ["mcp__azure-dataops-aca__action_bash"]
+  }
+}

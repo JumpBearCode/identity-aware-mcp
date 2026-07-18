@@ -10,5 +10,9 @@
         "scope": "api://88de6a37-cf75-40d3-83e8-44c5ccbc0895/user_impersonation"
       }
     }
+  },
+  "permission": {
+    "azure-dataops-aca_diagnose_bash": "allow",
+    "azure-dataops-aca_action_bash": "ask"
   }
 }
