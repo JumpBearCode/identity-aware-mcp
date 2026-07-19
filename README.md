@@ -61,7 +61,7 @@ Credential, persists files to Blob, and is deleted when the Session ends — the
 user gets a fresh microVM. Full design in
 [`docs/ACA-Redis-Implementation/`](docs/ACA-Redis-Implementation/README.md).
 
-## Quickstart — local docker
+## Quickstart — Local Hosting (Docker)
 
 ```bash
 # 1. Provision Entra apps, SPs, AD groups (Bicep, Microsoft.Graph extension)
@@ -81,21 +81,66 @@ cd ../.. && docker compose up --build
 #    { "servers": { "azure-dataops": { "url": "http://localhost:8081/mcp" } } }
 ```
 
-## Quickstart — ACA sandboxes (cloud)
+## Quickstart — Azure Hosting (ACA + ACA Sandbox)
 
-Deploys the full cloud footprint and runs the MCP server as a Container App. The
-runbook in [`provisioning/aca/README.md`](provisioning/aca/README.md) has the whole
-step-by-step (image build/push, secret injection, RBAC propagation, the 6 param
-traps). There's also a convergence runbook in the attribution docs
-([`docs/oid-log-tracking/` #5](docs/oid-log-tracking/README.md)).
+Deploys the full cloud footprint and runs the MCP server as a Container App via one
+`azd up`. The runbook in [`provisioning/aca/README.md`](provisioning/aca/README.md)
+has the phase-by-phase detail (prereqs, roles, what each phase does); a full
+walkthrough is in the azd-migration docs
+([`docs/en/azd-migration/`](docs/en/azd-migration/deployment-after-azd.md) ·
+中文 [`docs/zh/azd-migration/`](docs/zh/azd-migration/azd迁移后-部署说明.md)).
 
 ```bash
-cd provisioning/aca
-az deployment sub create -n dataops-mcp-aca -l westus2 -f main.bicep
-./write-env.sh dataops-mcp-aca            # writes ../../.env.aca
-# then: build/push the MCP + sandbox images to ACR, set the MCP OBO client secret,
-#       point your client at https://<MCP_FQDN>/mcp  (or /mcpproxy — see below)
+azd auth login && az login
+azd env new dataops-mcp-aca               # pick subscription + region (e.g. westus2)
+azd up                                    # provision + hooks + build/deploy the image
+# then: add users to the AD groups, and point your client at
+#       https://<MCP_FQDN>/mcp  (or /mcpproxy — see below)
+az ad group member add --group "$(azd env get-value DIAGNOSE_GROUP_ID)" --member-id <oid>
 ```
+
+### Tuning knobs — `azd env set`
+
+Every behavior/tuning variable below is controlled through the azd environment: set it
+and re-provision; leave it unset and the server uses its **in-code default** (Bicep
+never re-states the default, so there's a single source of truth). Mechanically each
+maps `${NAME=}` in `main.parameters.json` → a Bicep param → an `envOverrides` object →
+injected into the Container App only when non-empty.
+
+```bash
+azd env set MCP_EXEC_TIMEOUT 300 && azd provision     # example: raise the tool timeout
+azd env set MCP_EXEC_TIMEOUT "" && azd provision       # unset -> back to the code default
+```
+
+> Identity/wiring vars (`AZURE_TENANT_ID`, `MCP_APP_ID`, `REDIS_URL`, `STORAGE_ACCOUNT`,
+> `*_GROUP_ID`, …) are provisioned outputs and must **not** be set here — doing so
+> desyncs the app from the real resources. Full taxonomy in the azd-migration docs §6.
+
+| `azd env set` name | What it controls | Default |
+|---|---|---|
+| `SANDBOX_DISK_IMAGE` | ACR image the sandbox microVM boots from | `<acr>/mcp-sandbox:latest` |
+| `SANDBOX_DISK_ID` | Prebuilt sandbox disk resource id (overrides the image) | *(unset)* |
+| `SANDBOX_DISK` | Public disk name used as a fallback when no image/id is set | `ubuntu` |
+| `SANDBOX_CPU` | vCPU allocated per sandbox microVM | `1000m` |
+| `SANDBOX_MEMORY` | Memory allocated per sandbox microVM | `2048Mi` |
+| `SANDBOX_CREATE_TIMEOUT` | Max seconds to wait for a new sandbox to become ready | `30` |
+| `SANDBOX_AUTO_SUSPEND_SECONDS` | Idle seconds before a sandbox auto-suspends | `300` |
+| `SANDBOX_AUTO_DELETE_SECONDS` | Idle seconds before a sandbox is deleted | `3600` |
+| `SANDBOX_REAPER_INTERVAL` | How often (s) the reaper sweeps for idle/expired sandboxes | `300` |
+| `SANDBOX_REAPER_LEASE` | Reaper leader-election lease TTL (s) — only one replica reaps | `90` |
+| `SANDBOX_DISTRIBUTED_LOCK` | `1`/`0` — Redis lock so only one replica creates a Session's sandbox | `0` |
+| `SANDBOX_LOCK_TTL` | TTL (s) of that per-Session create lock | `60` |
+| `SANDBOX_LOCK_WAIT` | Max seconds to wait to acquire the create lock before giving up | `45` |
+| `MCP_SESSION_TTL` | Session sliding-window TTL (s) = how long a sandbox stays sticky | `1800` |
+| `MCP_EXEC_TIMEOUT` | Seconds the server waits for a tool command before timing out | `120` |
+| `MAX_OUTPUT_BYTES` | Cap on stdout/stderr bytes returned to the agent | `65536` |
+| `BLOB_MOUNTPOINT` | Path inside the sandbox where the Blob workspace is mounted | `/workspace` |
+| `MCPPROXY_ENABLED` | `true`/`false` — expose the `/mcpproxy` resource-stripping endpoint | `true` |
+| `AUDIT_TIMEOUT` | HTTP timeout (s) for shipping an audit row to the DCR endpoint | `5` |
+| `AUDIT_UA_INCLUDE_OID` | `1`/`0` — include the user `oid` in the User-Agent correlation tag | `0` |
+
+`MCP_CLIENT_SECRET` is also an azd env var, but it's set once by the postprovision hook;
+only touch it to rotate: `azd env set MCP_CLIENT_SECRET "" && azd provision`.
 
 ## Connect a client
 

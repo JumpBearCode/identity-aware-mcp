@@ -25,6 +25,9 @@ param environmentDefaultDomain string
 @description('MCP server container image. Placeholder until the real image is pushed to ACR.')
 param mcpImage string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
+@description('Whether this Container App already exists. When true, keep its currently-deployed image (azd swaps the real image in out-of-band) instead of resetting to the placeholder on re-provision.')
+param mcpAppExists bool = false
+
 @description('MCP server client secret (for OBO). Set during deploy after credential reset.')
 @secure()
 param mcpClientSecret string = ''
@@ -63,24 +66,49 @@ param auditDcrEndpoint string = ''
 param auditDcrImmutableId string = ''
 param auditStreamName string = 'Custom-MCPAudit_CL'
 
-@description('Redis-backed distributed sandbox lock: "1" on, "0" off. Matches the live default.')
-param sandboxDistributedLock string = '0'
+@description('Optional app-behavior overrides, keyed by the exact env-var name. Injected only when the value is non-empty; empty -> the server uses its in-code default. Wired from azd via main.parameters.json.')
+param envOverrides object = {}
+
+// Keep only the knobs the operator actually set (non-empty); the rest are dropped so
+// the server falls back to its in-code default. Single source of truth for defaults
+// stays in the app code — Bicep never re-states them.
+var optionalEnv = map(filter(items(envOverrides), o => !empty(o.value)), o => {
+  name: o.key
+  value: string(o.value)
+})
 
 var redisUrl = 'redis://${redisHost}:${redisPort}'
 // Deterministic public FQDN (matches ingress.fqdn) so the OAuth Protected
 // Resource Metadata advertises the real https URL, not localhost.
 var publicBaseUrl = 'https://${name}-mcp.${environmentDefaultDomain}'
 
+// `azd deploy` builds the real image and swaps it in after provision. On a later
+// provision, read the currently-deployed image back so we don't reset it to the
+// placeholder. This MUST be a separate module: an inline same-name `existing`
+// self-references the app and ARM rejects the template as a circular dependency.
+module fetchImage 'fetch-container-image.bicep' = {
+  name: '${name}-fetch-mcp-image'
+  params: {
+    name: '${name}-mcp'
+    exists: mcpAppExists
+  }
+}
+var effectiveImage = empty(fetchImage.outputs.image) ? mcpImage : fetchImage.outputs.image
+
 // Attach the ACR (with the app's system identity) only for a private azurecr.io
 // image. The cold-deploy placeholder is public, so this stays empty then and the
 // app can bootstrap before AcrPull (granted later in rbac.bicep). For an ACR image
 // it must be declared, else a redeploy drops the pull config (observed drift).
-var useAcrRegistry = contains(mcpImage, 'azurecr.io')
-var acrLoginServer = split(mcpImage, '/')[0]
+var useAcrRegistry = contains(effectiveImage, 'azurecr.io')
+var acrLoginServer = split(effectiveImage, '/')[0]
 
 resource app 'Microsoft.App/containerApps@2024-03-01' = {
   name: '${name}-mcp'
   location: location
+  // Lets `azd deploy` locate this app as the target of the `mcp` service.
+  tags: {
+    'azd-service-name': 'mcp'
+  }
   identity: {
     type: 'SystemAssigned'
   }
@@ -112,12 +140,12 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'mcp-server'
-          image: mcpImage
+          image: effectiveImage
           resources: {
             cpu: json('0.5')
             memory: '1Gi'
           }
-          env: [
+          env: concat([
             { name: 'EXECUTOR', value: 'aca' }
             { name: 'MCP_SERVER_BASE_URL', value: publicBaseUrl }
             { name: 'AZURE_TENANT_ID', value: tenantId }
@@ -138,11 +166,10 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = {
             { name: 'BLOB_CONTAINER', value: blobContainer }
             { name: 'BLOB_CONTAINER_RESOURCE_ID', value: blobContainerResourceId }
             { name: 'SANDBOX_DISK_IMAGE', value: sandboxImage }
-            { name: 'SANDBOX_DISTRIBUTED_LOCK', value: sandboxDistributedLock }
             { name: 'AUDIT_DCR_ENDPOINT', value: auditDcrEndpoint }
             { name: 'AUDIT_DCR_RULE_ID', value: auditDcrImmutableId }
             { name: 'AUDIT_STREAM_NAME', value: auditStreamName }
-          ]
+          ], optionalEnv)
         }
       ]
       scale: {

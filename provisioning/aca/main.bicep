@@ -34,9 +34,63 @@ param sandboxImage string = ''
 @secure()
 param mcpClientSecret string = ''
 
+@description('azd environment name — tags the RG so `azd deploy` can locate resources. Defaults to name for raw `az deployment` use.')
+param environmentName string = name
+
+@description('Whether the MCP Container App already exists. azd sets SERVICE_MCP_RESOURCE_EXISTS; true keeps the deployed image instead of the placeholder.')
+param mcpAppExists bool = false
+
+// --- Optional app-behavior overrides (all azd-settable via main.parameters.json) ---
+// Empty string -> NOT injected into the container, so the server uses its in-code
+// default. Each maps to the container env var of the same UPPER_SNAKE name.
+param sandboxDistributedLock string = ''
+param mcpExecTimeout string = ''
+param maxOutputBytes string = ''
+param mcpSessionTtl string = ''
+param mcpProxyEnabled string = ''
+param sandboxAutoSuspendSeconds string = ''
+param sandboxAutoDeleteSeconds string = ''
+param sandboxReaperInterval string = ''
+param sandboxReaperLease string = ''
+param sandboxLockTtl string = ''
+param sandboxLockWait string = ''
+param sandboxCreateTimeout string = ''
+param sandboxCpu string = ''
+param sandboxMemory string = ''
+param sandboxDisk string = ''
+param sandboxDiskId string = ''
+param blobMountpoint string = ''
+param auditTimeout string = ''
+param auditUaIncludeOid string = ''
+
+var envOverrides = {
+  SANDBOX_DISTRIBUTED_LOCK: sandboxDistributedLock
+  MCP_EXEC_TIMEOUT: mcpExecTimeout
+  MAX_OUTPUT_BYTES: maxOutputBytes
+  MCP_SESSION_TTL: mcpSessionTtl
+  MCPPROXY_ENABLED: mcpProxyEnabled
+  SANDBOX_AUTO_SUSPEND_SECONDS: sandboxAutoSuspendSeconds
+  SANDBOX_AUTO_DELETE_SECONDS: sandboxAutoDeleteSeconds
+  SANDBOX_REAPER_INTERVAL: sandboxReaperInterval
+  SANDBOX_REAPER_LEASE: sandboxReaperLease
+  SANDBOX_LOCK_TTL: sandboxLockTtl
+  SANDBOX_LOCK_WAIT: sandboxLockWait
+  SANDBOX_CREATE_TIMEOUT: sandboxCreateTimeout
+  SANDBOX_CPU: sandboxCpu
+  SANDBOX_MEMORY: sandboxMemory
+  SANDBOX_DISK: sandboxDisk
+  SANDBOX_DISK_ID: sandboxDiskId
+  BLOB_MOUNTPOINT: blobMountpoint
+  AUDIT_TIMEOUT: auditTimeout
+  AUDIT_UA_INCLUDE_OID: auditUaIncludeOid
+}
+
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
   name: resourceGroupName
   location: location
+  tags: {
+    'azd-env-name': environmentName
+  }
 }
 
 // --- Entra identity (Graph, tenant scope) ---
@@ -139,7 +193,12 @@ module mcpApp 'modules/mcp-app.bicep' = {
     storageAccount: storage.outputs.storageAccountName
     blobContainer: storage.outputs.blobContainerName
     blobContainerResourceId: storage.outputs.blobContainerResourceId
-    sandboxImage: sandboxImage
+    // Deterministic sandbox image ref: ACR login server is known at provision
+    // time; the image itself is pushed by the postprovision hook before the
+    // manager ever pulls it. Removes the old post-deploy `--set-env-vars`.
+    sandboxImage: empty(sandboxImage) ? '${registry.outputs.loginServer}/mcp-sandbox:latest' : sandboxImage
+    mcpAppExists: mcpAppExists
+    envOverrides: envOverrides
     auditDcrEndpoint: observability.outputs.dcrEndpoint
     auditDcrImmutableId: observability.outputs.dcrImmutableId
     auditStreamName: observability.outputs.streamName
@@ -189,7 +248,7 @@ module workerRbac 'modules/worker-rbac.bicep' = {
   }
 }
 
-// --- Outputs (consumed by write-env.sh) ---
+// --- Outputs (captured into the azd env; also read by e2e_deployed.py) ---
 output AZURE_TENANT_ID string = tenant().tenantId
 output AZURE_SUBSCRIPTION_ID string = subscription().subscriptionId
 output RESOURCE_GROUP string = rg.name
@@ -209,6 +268,8 @@ output BLOB_CONTAINER string = storage.outputs.blobContainerName
 output BLOB_CONTAINER_RESOURCE_ID string = storage.outputs.blobContainerResourceId
 output REGISTRY_LOGIN_SERVER string = registry.outputs.loginServer
 output REGISTRY_NAME string = registry.outputs.registryName
+// azd's containerapp deploy target reads this to know which ACR to push to.
+output AZURE_CONTAINER_REGISTRY_ENDPOINT string = registry.outputs.loginServer
 output MCP_APP_NAME string = mcpApp.outputs.mcpAppName
 output MCP_FQDN string = mcpApp.outputs.mcpFqdn
 output MCP_PRINCIPAL_ID string = mcpApp.outputs.mcpPrincipalId
