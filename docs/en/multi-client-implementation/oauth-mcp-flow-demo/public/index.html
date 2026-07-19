@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MCP · OAuth Authorization Flow Visual Tutorial</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">🔐</span>
+      <div class="brand-text">
+        <h1>Identity-Aware MCP · Authorization Flow Visualization</h1>
+        <p>Walk through the 14-step sequence diagram of <code>/mcpproxy</code> step by step — see the real JSON for each request/response</p>
+      </div>
+    </div>
+    <div class="mode-switch" role="tablist" aria-label="Mode">
+      <button id="modeDemo" class="mode-btn active" role="tab">Demo Replay</button>
+      <button id="modeLive" class="mode-btn" role="tab">Live Real Call</button>
+    </div>
+  </header>
+
+  <div class="flowbar">
+    <div class="flow-switch" role="tablist" aria-label="Flow">
+      <button id="flowProxy" class="flow-btn active" role="tab">
+        <span class="fb-title">🪄 MCP proxy</span><span class="fb-sub">Stripped resource · 14 steps</span>
+      </button>
+      <span class="flow-vs">vs</span>
+      <button id="flowDirect" class="flow-btn" role="tab">
+        <span class="fb-title">⚙️ MCP Direct</span><span class="fb-sub">Direct to Entra · 11 steps</span>
+      </button>
+    </div>
+    <p id="flowTagline" class="flow-tagline"></p>
+  </div>
+
+  <main class="layout">
+    <!-- Left: Sequence Diagram -->
+    <section class="diagram-pane">
+      <div class="diagram-scroll" id="diagramScroll">
+        <svg id="diagram" xmlns="http://www.w3.org/2000/svg"></svg>
+      </div>
+    </section>
+
+    <!-- Right: Current Step Details -->
+    <section class="detail-pane">
+      <div class="step-head">
+        <div class="step-badge" id="stepBadge">0 / 14</div>
+        <div class="step-titles">
+          <h2 id="stepTitle">Ready</h2>
+          <p id="stepDesc">Click <b>▶ Play</b> or <b>Next Step</b> to start from "No token hits 401" and walk through the entire authorization flow step by step.</p>
+        </div>
+        <span class="step-dir" id="stepDir"></span>
+      </div>
+
+      <div id="highlights" class="highlights"></div>
+
+      <div class="wire" id="wire">
+        <!-- request / response / note cards injected by JS -->
+        <div class="placeholder" id="placeholder">
+          <div class="placeholder-inner">
+            <div class="pl-icon">🎬</div>
+            <p>This pipeline passes messages among the Client, proxy route, Entra, and MCP endpoint.</p>
+            <p class="muted">Demo mode replays data close to real packet captures; Live mode will actually call your MCP server (including browser login).</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live mode login panel (hidden by default) -->
+      <div id="livePanel" class="live-panel hidden"></div>
+    </section>
+  </main>
+
+  <footer class="controls">
+    <button id="btnRestart" class="ctl" title="Restart">⟲ Restart</button>
+    <button id="btnPrev" class="ctl" title="Previous Step">◀ Previous</button>
+    <button id="btnPlay" class="ctl ctl-primary" title="Play / Pause">▶ Play</button>
+    <button id="btnNext" class="ctl" title="Next Step">Next ▶</button>
+    <div class="spacer"></div>
+    <label class="speed">
+      Speed
+      <input id="speed" type="range" min="0.5" max="2.5" step="0.5" value="1" />
+      <span id="speedVal">1.0×</span>
+    </label>
+    <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+  </footer>
+
+  <script src="steps.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
