@@ -92,12 +92,11 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
         isEnabled: true
       }
     ]
-    // Only VS Code is pre-authorized here. The CLI client is deliberately NOT added
-    // to this list: mcpServerApp.preAuth -> cliClientApp.appId while
-    // cliClientApp.requiredResourceAccess -> mcpServerApp.appId would be a reference
-    // cycle (same class as the mcp-app circular dep). The CLI client is consented
-    // instead via cliClientOboGrant below (references SPs, not this list -> no cycle),
-    // which is what makes /mcpproxy tokens accepted — see deployment-gotchas §4.
+    // Only VS Code is pre-authorized here. The CLI client is deliberately NOT added:
+    // mcpServerApp.preAuth -> cliClientApp.appId while cliClientApp.requiredResourceAccess
+    // -> mcpServerApp.appId is a reference cycle (same class as the mcp-app circular dep).
+    // The CLI client instead relies on standard first-sign-in user consent — the tenant
+    // allows user consent (authorizationPolicy). Being validated; see deployment-gotchas §4.
     preAuthorizedApplications: [
       {
         appId: vscodeClientId
@@ -151,19 +150,6 @@ resource oboGrant 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = {
   consentType: 'AllPrincipals'
   resourceId: graphSp.id
   scope: graphOboScope
-}
-
-// CLI client -> MCP server API: tenant-wide admin consent for user_impersonation.
-// Replaces pre-authorizing the CLI client in mcpServerApp.preAuthorizedApplications
-// (which would be a reference cycle — see the NOTE above). A grant references the two
-// SPs, not the app preAuth list, so there is no cycle; and it fully consents the scope
-// so /mcpproxy tokens carry aud=MCP API + user_impersonation and the server accepts
-// them. Without this the client can *get* a token but the server 401s it — deployment-gotchas §4.
-resource cliClientOboGrant 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = {
-  clientId: cliClientSp.id
-  consentType: 'AllPrincipals'
-  resourceId: mcpServerSp.id
-  scope: 'user_impersonation'
 }
 
 // --- AD groups that gate tool access ---
