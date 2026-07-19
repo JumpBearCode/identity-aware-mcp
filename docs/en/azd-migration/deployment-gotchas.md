@@ -212,6 +212,22 @@ After Entra propagates (1–2 min), re-authenticating succeeds.
 **Root fix**: add `cliClientAppId` to `preAuthorizedApplications` in `identity.bicep`
 (alongside VS Code).
 
+> **⚠️ Correction (disproven by testing):** treating #4 as a "must pre-authorize" bug
+> was a **misdiagnosis**. After clearing the stale token and re-signing in, standard
+> **user consent works** — on first sign-in Entra shows a two-app **combined consent**
+> (① CLI client → MCP server; ② MCP server → Graph, the OBO downstream); click `Next`
+> + `Accept` and Entra remembers it thereafter. The earlier "token rejected" was really
+> **a stale, invalid token cached client-side — the flow never reached these two
+> screens**. Conclusion: keeping `identity.bicep` on "don't preAuth the CLI client, use
+> user consent" is correct; preAuth is only an **optional convenience** (saves each user
+> those first clicks), not a bug fix. The `oauth2PermissionGrant` (AllPrincipals admin
+> consent) we briefly added was **reverted** (commit `990ad82`) — broad admin consent is
+> impractical and user consent suffices.
+> **Which step preAuth saves:** it directly removes screen ① (the CLI-client consent);
+> since Entra's combined consent pulls in the OBO-downstream screen ② whenever ① needs
+> consent, removing ① means ② (which rides the admin `oboGrant`) doesn't show either —
+> so preAuth removes the whole first-time consent step.
+
 ---
 
 ## Gotcha 5 · sandbox cold-create timeout (the timeout record)
