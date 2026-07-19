@@ -12,6 +12,22 @@ set -eu
 echo "==> [postprovision] Building sandbox image in ACR ($REGISTRY_NAME)..."
 az acr build -r "$REGISTRY_NAME" -t mcp-sandbox:latest ./src/sandbox-image
 
+# Create the worker-SP <- sandbox-group-MI federated credentials HERE, not in Bicep.
+# A Microsoft.Graph FIC must name its parent SP app as `uniqueName/cred`, which ARM
+# preflights as an `existing` lookup BEFORE the SP exists on a clean deploy — an
+# unavoidable race that failed both a standalone fic.bicep and co-locating it in
+# identity.bicep (deployment-gotchas §1). By now provision has created the SP apps, so
+# `az ad app federated-credential create` just works. delete-then-create keeps it
+# idempotent and picks up a changed MI subject on re-provision.
+create_fic() {  # $1=sp-app-id  $2=cred-name  $3=mi-principal-id
+  az ad app federated-credential delete --id "$1" --federated-credential-id "$2" >/dev/null 2>&1 || true
+  az ad app federated-credential create --id "$1" --parameters "{\"name\":\"$2\",\"issuer\":\"https://login.microsoftonline.com/$AZURE_TENANT_ID/v2.0\",\"subject\":\"$3\",\"audiences\":[\"api://AzureADTokenExchange\"]}" >/dev/null \
+    && echo "  FIC $2 -> subject $3: ok" || echo "  FIC $2: FAILED"
+}
+echo "==> [postprovision] Creating worker-SP federated credentials..."
+create_fic "$DIAGNOSE_SP_APP_ID" "diagnose-sandbox-mi" "$DIAGNOSE_MI_PRINCIPAL_ID"
+create_fic "$ACTION_SP_APP_ID"   "action-sandbox-mi"   "$ACTION_MI_PRINCIPAL_ID"
+
 # Inject the MCP server's OBO client secret straight into the Container App.
 # We deliberately do NOT round-trip it through the azd env: calling `azd env set`
 # from inside a hook is unreliable (azd re-entrancy) and silently no-op'd the first

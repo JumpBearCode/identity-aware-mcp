@@ -99,11 +99,6 @@ module identity 'modules/identity.bicep' = {
   scope: rg
   params: {
     name: name
-    // FIC now lives in identity.bicep (co-located with the worker SPs to dodge the
-    // Graph preflight race). It needs the sandbox-group MI principalIds -> identity
-    // depends on sandboxGroups now.
-    diagnoseMiPrincipalId: sandboxGroups.outputs.diagnoseMiPrincipalId
-    actionMiPrincipalId: sandboxGroups.outputs.actionMiPrincipalId
   }
 }
 
@@ -252,6 +247,9 @@ output DIAGNOSE_GROUP_ID string = identity.outputs.diagnoseGroupId
 output ACTION_GROUP_ID string = identity.outputs.actionGroupId
 output DIAGNOSE_SP_APP_ID string = identity.outputs.diagnoseSpAppId
 output ACTION_SP_APP_ID string = identity.outputs.actionSpAppId
+// Sandbox-group MI principalIds — the postprovision hook uses them as the FIC subject.
+output DIAGNOSE_MI_PRINCIPAL_ID string = sandboxGroups.outputs.diagnoseMiPrincipalId
+output ACTION_MI_PRINCIPAL_ID string = sandboxGroups.outputs.actionMiPrincipalId
 output DIAGNOSE_SANDBOX_GROUP string = sandboxGroups.outputs.diagnoseGroupName
 output ACTION_SANDBOX_GROUP string = sandboxGroups.outputs.actionGroupName
 output REDIS_HOST string = redis.outputs.redisHost

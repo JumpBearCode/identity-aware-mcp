@@ -2,9 +2,9 @@
   "mcpServers": {
     "azure-dataops-aca": {
       "type": "http",
-      "url": "https://dataops-mcp-mcp.calmsand-9a967656.westus2.azurecontainerapps.io/mcpproxy",
+      "url": "https://dataops-mcp-mcp.wittytree-2e4058f0.westus2.azurecontainerapps.io/mcpproxy",
       "oauth": {
-        "clientId": "32b136f2-7d92-46e5-b647-921bae02a356",
+        "clientId": "59a08db5-5fa6-42d9-9720-2b006c321478",
         "callbackPort": 8080
       }
     }

@@ -6,12 +6,13 @@
 // user_impersonation + OBO admin consent), two AD groups, and the
 // diagnose-sp / action-sp worker app registrations.
 //
-// Also includes the Federated Identity Credentials (worker SP <- sandbox-group MI).
-// They need the sandbox-group MI principalId (passed in as a param from
-// sandbox-groups.bicep) and are co-located with the worker SP apps HERE on purpose:
-// a standalone module referencing the SPs via `existing` hit a Graph preflight race
-// (validated before the SPs were created) that failed the first deploy —
-// see docs/{en,zh}/azd-migration deployment-gotchas §1.
+// What's NOT here: the Federated Identity Credentials (worker SP <- sandbox-group MI).
+// A Microsoft.Graph FIC resource must name its parent SP app as `uniqueName/cred`,
+// which ARM ALWAYS resolves as an `existing` lookup and preflights BEFORE the SP is
+// created on a clean deploy — an unavoidable race, whether the FIC sits in its own
+// module or is co-located here (both were tried and failed). So the FICs are created
+// imperatively by the postprovision hook, after provision has built the SPs.
+// See docs/{en,zh}/azd-migration deployment-gotchas §1.
 
 // RG-scoped (not tenant): the Microsoft.Graph extension routes apps/groups/
 // grants to Graph regardless of the ARM deployment scope, and an RG-scoped
@@ -32,12 +33,6 @@ param vscodeClientId string = 'aebc6443-996d-45c2-90f0-388ff96faa56'
 param cliClientRedirectUris array = [
   'http://localhost:8080/callback'
 ]
-
-@description('Diagnose sandbox-group MI principalId (FIC subject). From sandbox-groups.bicep.')
-param diagnoseMiPrincipalId string
-
-@description('Action sandbox-group MI principalId (FIC subject). From sandbox-groups.bicep.')
-param actionMiPrincipalId string
 
 var graphAppId = '00000003-0000-0000-c000-000000000000'
 
@@ -190,31 +185,10 @@ resource actionSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
   appId: actionSpApp.appId
 }
 
-// --- Federated Identity Credentials: each worker SP trusts its sandbox-group MI ---
-// Co-located with the worker SP apps above (same module / compilation unit) so there
-// is NO cross-module `existing` reference — the standalone fic.bicep used `existing`
-// to find these SPs and ARM validated it at preflight, before the SPs were created,
-// which failed the first deploy (deployment-gotchas §1). Inside a sandbox the group
-// MI token (aud api://AzureADTokenExchange) is exchanged for the worker SP via
-// `az login --federated-token` — no secret anywhere in the cloud.
-var ficIssuer = 'https://login.microsoftonline.com/${tenant().tenantId}/v2.0'
-var ficAudiences = [ 'api://AzureADTokenExchange' ]
-
-resource diagnoseFic 'Microsoft.Graph/applications/federatedIdentityCredentials@v1.0' = {
-  name: '${diagnoseSpApp.uniqueName}/diagnose-sandbox-mi'
-  description: 'Trust the diagnose sandbox group managed identity'
-  issuer: ficIssuer
-  subject: diagnoseMiPrincipalId
-  audiences: ficAudiences
-}
-
-resource actionFic 'Microsoft.Graph/applications/federatedIdentityCredentials@v1.0' = {
-  name: '${actionSpApp.uniqueName}/action-sandbox-mi'
-  description: 'Trust the action sandbox group managed identity'
-  issuer: ficIssuer
-  subject: actionMiPrincipalId
-  audiences: ficAudiences
-}
+// NOTE: the worker-SP <- sandbox-group-MI Federated Identity Credentials are created
+// by the postprovision hook (az ad app federated-credential create), NOT here — a
+// Bicep FIC unavoidably preflights its parent SP as `existing` before it exists on a
+// clean deploy. See the header note and deployment-gotchas §1.
 
 output mcpAppId string = mcpServerApp.appId
 // Application ID URI the server advertises as its OAuth scope prefix
