@@ -99,6 +99,11 @@ module identity 'modules/identity.bicep' = {
   scope: rg
   params: {
     name: name
+    // FIC now lives in identity.bicep (co-located with the worker SPs to dodge the
+    // Graph preflight race). It needs the sandbox-group MI principalIds -> identity
+    // depends on sandboxGroups now.
+    diagnoseMiPrincipalId: sandboxGroups.outputs.diagnoseMiPrincipalId
+    actionMiPrincipalId: sandboxGroups.outputs.actionMiPrincipalId
   }
 }
 
@@ -221,22 +226,9 @@ module rbac 'modules/rbac.bicep' = {
   }
 }
 
-// --- FIC: worker SP <- sandbox-group MI trust (Graph, tenant scope) ---
-module fic 'modules/fic.bicep' = {
-  name: 'fic'
-  scope: rg
-  // Explicit: FIC references the worker SP apps by uniqueName (existing), which
-  // must already be created by the identity module before fic preflights.
-  dependsOn: [
-    identity
-  ]
-  params: {
-    name: name
-    tenantId: tenant().tenantId
-    diagnoseMiPrincipalId: sandboxGroups.outputs.diagnoseMiPrincipalId
-    actionMiPrincipalId: sandboxGroups.outputs.actionMiPrincipalId
-  }
-}
+// --- FIC moved into identity.bicep (co-located with the worker SP apps, same
+//     compilation unit) so ARM no longer preflight-validates an `existing` SP
+//     reference before the SPs exist. See deployment-gotchas §1. ---
 
 // --- Worker SP Azure RBAC (subscription scope) ---
 // diagnose-sp -> Reader (read-only investigation); action-sp -> Contributor.

@@ -12,20 +12,17 @@ set -eu
 echo "==> [postprovision] Building sandbox image in ACR ($REGISTRY_NAME)..."
 az acr build -r "$REGISTRY_NAME" -t mcp-sandbox:latest ./src/sandbox-image
 
-# The OBO secret value is only returned at creation time, and `credential reset`
-# invalidates the prior one — so reset it once, stash it in the azd env (passed
-# back as the secure `mcpClientSecret` param on every later provision so re-runs
-# never clobber it with the placeholder), and apply it now so THIS deploy works.
-# Rotate deliberately with:  azd env set MCP_CLIENT_SECRET ""  &&  azd provision
-if [ -z "$(azd env get-value MCP_CLIENT_SECRET 2>/dev/null || true)" ]; then
-  echo "==> [postprovision] Resetting + injecting MCP OBO client secret..."
-  secret=$(az ad app credential reset --id "$MCP_APP_ID" --display-name azd --query password -o tsv)
-  azd env set MCP_CLIENT_SECRET "$secret"
-  az containerapp secret set -n "$MCP_APP_NAME" -g "$RESOURCE_GROUP" \
-    --secrets mcp-client-secret="$secret" >/dev/null
-else
-  echo "==> [postprovision] MCP OBO secret already in azd env; skipping reset."
-fi
+# Inject the MCP server's OBO client secret straight into the Container App.
+# We deliberately do NOT round-trip it through the azd env: calling `azd env set`
+# from inside a hook is unreliable (azd re-entrancy) and silently no-op'd the first
+# time — see deployment-gotchas §3. Trade-off of not storing it: Bicep reseeds the
+# placeholder every `provision` (the mcpClientSecret param stays empty), so we reset
+# + inject on every run. `credential reset` returns the new password only here; it is
+# piped straight into `secret set` and never echoed, so it does not leak into logs.
+echo "==> [postprovision] Resetting + injecting MCP OBO client secret..."
+secret=$(az ad app credential reset --id "$MCP_APP_ID" --display-name azd --query password -o tsv)
+az containerapp secret set -n "$MCP_APP_NAME" -g "$RESOURCE_GROUP" \
+  --secrets mcp-client-secret="$secret" >/dev/null
 
 echo ""
 echo "==> [postprovision] Done. Remaining manual step — add users to the AD groups:"

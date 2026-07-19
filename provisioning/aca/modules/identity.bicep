@@ -6,10 +6,12 @@
 // user_impersonation + OBO admin consent), two AD groups, and the
 // diagnose-sp / action-sp worker app registrations.
 //
-// What's NOT here: the Federated Identity Credentials that let each worker SP
-// be assumed by its sandbox-group managed identity. Those need the sandbox-group
-// MI principalId, which only exists after sandbox-groups.bicep runs — so they
-// live in fic.bicep, wired last.
+// Also includes the Federated Identity Credentials (worker SP <- sandbox-group MI).
+// They need the sandbox-group MI principalId (passed in as a param from
+// sandbox-groups.bicep) and are co-located with the worker SP apps HERE on purpose:
+// a standalone module referencing the SPs via `existing` hit a Graph preflight race
+// (validated before the SPs were created) that failed the first deploy —
+// see docs/{en,zh}/azd-migration deployment-gotchas §1.
 
 // RG-scoped (not tenant): the Microsoft.Graph extension routes apps/groups/
 // grants to Graph regardless of the ARM deployment scope, and an RG-scoped
@@ -30,6 +32,12 @@ param vscodeClientId string = 'aebc6443-996d-45c2-90f0-388ff96faa56'
 param cliClientRedirectUris array = [
   'http://localhost:8080/callback'
 ]
+
+@description('Diagnose sandbox-group MI principalId (FIC subject). From sandbox-groups.bicep.')
+param diagnoseMiPrincipalId string
+
+@description('Action sandbox-group MI principalId (FIC subject). From sandbox-groups.bicep.')
+param actionMiPrincipalId string
 
 var graphAppId = '00000003-0000-0000-c000-000000000000'
 
@@ -84,11 +92,12 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
         isEnabled: true
       }
     ]
-    // NOTE: only VS Code is pre-authorized here. The CLI client (below) is
-    // intentionally NOT pre-authorized (relies on user/admin consent). Adding it
-    // here would create a mcpServerApp<->cliClientApp reference cycle; to skip the
-    // consent screen later, pre-authorize the CLI client out-of-band (az) — see
-    // docs/multi-client-implementation/MCP-自定义Client接入-...md §6.
+    // Only VS Code is pre-authorized here. The CLI client is deliberately NOT added
+    // to this list: mcpServerApp.preAuth -> cliClientApp.appId while
+    // cliClientApp.requiredResourceAccess -> mcpServerApp.appId would be a reference
+    // cycle (same class as the mcp-app circular dep). The CLI client is consented
+    // instead via cliClientOboGrant below (references SPs, not this list -> no cycle),
+    // which is what makes /mcpproxy tokens accepted — see deployment-gotchas §4.
     preAuthorizedApplications: [
       {
         appId: vscodeClientId
@@ -144,6 +153,19 @@ resource oboGrant 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = {
   scope: graphOboScope
 }
 
+// CLI client -> MCP server API: tenant-wide admin consent for user_impersonation.
+// Replaces pre-authorizing the CLI client in mcpServerApp.preAuthorizedApplications
+// (which would be a reference cycle — see the NOTE above). A grant references the two
+// SPs, not the app preAuth list, so there is no cycle; and it fully consents the scope
+// so /mcpproxy tokens carry aud=MCP API + user_impersonation and the server accepts
+// them. Without this the client can *get* a token but the server 401s it — deployment-gotchas §4.
+resource cliClientOboGrant 'Microsoft.Graph/oauth2PermissionGrants@v1.0' = {
+  clientId: cliClientSp.id
+  consentType: 'AllPrincipals'
+  resourceId: mcpServerSp.id
+  scope: 'user_impersonation'
+}
+
 // --- AD groups that gate tool access ---
 resource diagnoseGroup 'Microsoft.Graph/groups@v1.0' = {
   uniqueName: '${name}-diagnose-users'
@@ -180,6 +202,32 @@ resource actionSpApp 'Microsoft.Graph/applications@v1.0' = {
 
 resource actionSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
   appId: actionSpApp.appId
+}
+
+// --- Federated Identity Credentials: each worker SP trusts its sandbox-group MI ---
+// Co-located with the worker SP apps above (same module / compilation unit) so there
+// is NO cross-module `existing` reference — the standalone fic.bicep used `existing`
+// to find these SPs and ARM validated it at preflight, before the SPs were created,
+// which failed the first deploy (deployment-gotchas §1). Inside a sandbox the group
+// MI token (aud api://AzureADTokenExchange) is exchanged for the worker SP via
+// `az login --federated-token` — no secret anywhere in the cloud.
+var ficIssuer = 'https://login.microsoftonline.com/${tenant().tenantId}/v2.0'
+var ficAudiences = [ 'api://AzureADTokenExchange' ]
+
+resource diagnoseFic 'Microsoft.Graph/applications/federatedIdentityCredentials@v1.0' = {
+  name: '${diagnoseSpApp.uniqueName}/diagnose-sandbox-mi'
+  description: 'Trust the diagnose sandbox group managed identity'
+  issuer: ficIssuer
+  subject: diagnoseMiPrincipalId
+  audiences: ficAudiences
+}
+
+resource actionFic 'Microsoft.Graph/applications/federatedIdentityCredentials@v1.0' = {
+  name: '${actionSpApp.uniqueName}/action-sandbox-mi'
+  description: 'Trust the action sandbox group managed identity'
+  issuer: ficIssuer
+  subject: actionMiPrincipalId
+  audiences: ficAudiences
 }
 
 output mcpAppId string = mcpServerApp.appId
