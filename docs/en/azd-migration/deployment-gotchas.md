@@ -13,13 +13,18 @@
 
 ## Overview
 
-| # | Problem | Layer | Root cause in one line | Status |
+> **The Status column is mid-exploration; the final state is in "Final truth & wrap-up"
+> at the end — it ended in a single successful `azd up`, and the real culprit behind the
+> long race was soft-delete.**
+
+| # | Problem | Layer | Root cause in one line | Final status |
 |---|---|---|---|---|
-| 1 | `fic` module can't find the worker SP | Microsoft.Graph ext + ARM preflight | The `existing` reference is validated at **preflight, before** the SP is created; `dependsOn` doesn't govern preflight | Rerun to bypass · **not yet root-fixed** |
+| 1 | `fic` module can't find the worker SP | Microsoft.Graph ext + ARM preflight | The `existing` reference is validated at **preflight, before** the SP is created; `dependsOn` doesn't govern preflight | ✅ FIC moved to the postprovision hook |
 | 2 | `mcp-app` circular dependency | ARM dependency graph (static) | Same-name `existing` + the main resource = a self-cycle; the `if` condition doesn't affect the static cycle check | ✅ Fixed (`fetch-container-image.bicep`) |
-| 3 | OBO secret not injected into the container | azd hook re-entrancy | Calling `azd env set` from **inside** a postprovision hook is unreliable | Manual patch · **not yet root-fixed** |
-| 4 | Client token rejected by the server | Entra pre-authorization | The MCP API's `preAuthorizedApplications` omits the self-built CLI client | Manual patch · **not yet root-fixed** |
-| 5 | First tool call errors out | sandbox cold-start | Cold image pull + microVM boot > default `SANDBOX_CREATE_TIMEOUT=30s` | Retry succeeds · raise the timeout |
+| 3 | OBO secret not injected into the container | azd hook re-entrancy | Calling `azd env set` from **inside** a postprovision hook is unreliable | ✅ hook `secret set` directly |
+| 4 | Client token rejected by the server | ~~Entra pre-authorization~~ | **Misjudged**: really a stale invalid token; user consent works (see §4 correction) | ✅ original design correct |
+| 5 | First tool call errors out | sandbox cold-start | Cold image pull + microVM boot > default `SANDBOX_CREATE_TIMEOUT=30s` | ✅ default 45 |
+| ★ | **The real culprit: soft-deleted uniqueName** | Entra soft-delete | Repeated `azd down`/delete → soft-deleted uniqueName reserved ~30 days → app recreate fails → the whole "appId race" | ⚠️ purge `deletedItems` before rebuild |
 
 **Deployment timeline** (how they chain):
 `provision#1` hits #1 (SP partly created) → `provision#2` hits #2 (first 6 resources created) → fix #2 → `provision#3` **succeeds** but #3 (secret not applied) → manually patch secret → `deploy` succeeds → repoint `.mcp.json` + add group members → client reconnect hits #4 (token rejected) → fix #4 → reconnect works → first `diagnose_bash` hits #5 (timeout) → retry succeeds, new instance verified on both channels.
@@ -277,3 +282,66 @@ On the new deployment, the **first** `diagnose_bash` call errors out (empty erro
 
 Once #1/#3/#4 are root-fixed, the goal is: `azd up` + add group members + point the
 client — with none of the manual steps 2–4 or 6.
+
+---
+
+## Final truth & wrap-up (updated 2026-07-19, tested)
+
+§1–§5 + the appendix above are a faithful record of the *exploration* (misjudgments
+included). After 6+ deploy attempts, here is the truth and the wrap-up — it supersedes
+the "not yet root-fixed / root-fix direction" notes above.
+
+### ① One `azd up` succeeded
+
+A single `azd up` completed end-to-end in 4.5 min (provision + deploy): FICs created by
+the hook, OBO secret auto-injected, `/mcp` healthy, both `diagnose_bash` / `action_bash`
+channels running as their own SPs (Reader / Contributor). Gotchas 1/3/5 root-fixed and
+**verified**.
+
+### ② The real culprit was soft-delete, not Graph-extension magic
+
+The long `appId does not exist` / `uniqueName already exists` loop — which made approach
+A (FIC in identity), the `parent:` form, and approach D (FIC in the hook) all look
+"unpassable" — was **not** a deployment race. It was **soft-delete**:
+
+- `az ad app/group delete` and `azd down` only SOFT-delete Entra objects;
+- a **soft-deleted uniqueName stays reserved ~30 days**;
+- so `identity.bicep` fails to recreate the same-name app (uniqueName conflict) → the app
+  is never built → its `appId` never generates → the SP referencing it reports `appId
+  does not exist` (looks like a "race", is really "the app was never built");
+- repeatedly `azd down`-ing + hand-deleting piled up soft-deletes and trapped me in a loop.
+
+**Fix — purge the directory `deletedItems`** (applications and groups):
+```bash
+az rest --method get --url "https://graph.microsoft.com/v1.0/directory/deletedItems/microsoft.graph.application?\$filter=startswith(uniqueName,'dataops-mcp')&\$select=id" --query "value[].id" -o tsv | while read -r id; do
+  az rest --method delete --url "https://graph.microsoft.com/v1.0/directory/deletedItems/$id"
+done
+# groups: .../deletedItems/microsoft.graph.group
+```
+After purging, approach D goes through in one pass. **A genuine first deploy (these
+uniqueNames never existed in the tenant) has no soft-deletes and never hits this.**
+
+### ③ Does `azd down` auto-purge the uniqueName? — No
+
+- `azd down --purge`'s `--purge` only applies to **soft-delete-capable Azure resources**
+  (Key Vault / APIM / Cognitive Services, …), **not Entra objects**;
+- and `azd down` **doesn't delete the Entra app/group/SP at all** (created by the
+  Microsoft.Graph extension; azd leaves them) — so it neither deletes nor purges them;
+- to delete-and-cleanly-recreate: purge `deletedItems` manually (above), or add a
+  `predown`/`postdown` hook that deletes + purges the Entra objects. Rarely needed daily.
+
+### ④ Wrap-up (final state per gotcha)
+
+| Gotcha | Final fix | Status |
+|---|---|---|
+| 1 FIC race | FIC out of Bicep, created by the **postprovision hook** (`az ad app federated-credential create`, SP already exists → no preflight). In Bicep, neither a standalone module nor co-locating in identity escapes the `existing`/`parent` preflight | ✅ one-pass verified |
+| 2 circular dep | split `fetch-container-image.bicep` | ✅ |
+| 3 secret injection | hook `az containerapp secret set` directly (no in-hook `azd env set`); trade-off: resets once per provision | ✅ auto-inject verified |
+| 4 CLI consent | **misjudged**; user consent works, keep not-preAuth (see §4) | ✅ original design correct |
+| 5 cold-create timeout | `SANDBOX_CREATE_TIMEOUT` default 30→45 | ✅ first call succeeded |
+| ★ soft-delete | purge `deletedItems` before rebuild (azd won't auto-purge Entra) | ⚠️ only when repeatedly down/rebuilding |
+
+> **On "fully clean":** the successful run was **Graph from zero (purged) + RG incremental
+> (leftover from failed runs)**. The appId race lives in the Graph layer and RG increment
+> doesn't affect it, so the conclusion holds. "RG also from zero" only makes it smoother;
+> not separately re-run but logically clear.
