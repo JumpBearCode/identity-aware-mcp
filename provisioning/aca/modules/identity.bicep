@@ -6,10 +6,13 @@
 // user_impersonation + OBO admin consent), two AD groups, and the
 // diagnose-sp / action-sp worker app registrations.
 //
-// What's NOT here: the Federated Identity Credentials that let each worker SP
-// be assumed by its sandbox-group managed identity. Those need the sandbox-group
-// MI principalId, which only exists after sandbox-groups.bicep runs — so they
-// live in fic.bicep, wired last.
+// What's NOT here: the Federated Identity Credentials (worker SP <- sandbox-group MI).
+// A Microsoft.Graph FIC resource must name its parent SP app as `uniqueName/cred`,
+// which ARM ALWAYS resolves as an `existing` lookup and preflights BEFORE the SP is
+// created on a clean deploy — an unavoidable race, whether the FIC sits in its own
+// module or is co-located here (both were tried and failed). So the FICs are created
+// imperatively by the postprovision hook, after provision has built the SPs.
+// See docs/{en,zh}/azd-migration deployment-gotchas §1.
 
 // RG-scoped (not tenant): the Microsoft.Graph extension routes apps/groups/
 // grants to Graph regardless of the ARM deployment scope, and an RG-scoped
@@ -84,11 +87,11 @@ resource mcpServerApp 'Microsoft.Graph/applications@v1.0' = {
         isEnabled: true
       }
     ]
-    // NOTE: only VS Code is pre-authorized here. The CLI client (below) is
-    // intentionally NOT pre-authorized (relies on user/admin consent). Adding it
-    // here would create a mcpServerApp<->cliClientApp reference cycle; to skip the
-    // consent screen later, pre-authorize the CLI client out-of-band (az) — see
-    // docs/multi-client-implementation/MCP-自定义Client接入-...md §6.
+    // Only VS Code is pre-authorized here. The CLI client is deliberately NOT added:
+    // mcpServerApp.preAuth -> cliClientApp.appId while cliClientApp.requiredResourceAccess
+    // -> mcpServerApp.appId is a reference cycle (same class as the mcp-app circular dep).
+    // The CLI client instead relies on standard first-sign-in user consent — the tenant
+    // allows user consent (authorizationPolicy). Being validated; see deployment-gotchas §4.
     preAuthorizedApplications: [
       {
         appId: vscodeClientId
@@ -181,6 +184,11 @@ resource actionSpApp 'Microsoft.Graph/applications@v1.0' = {
 resource actionSp 'Microsoft.Graph/servicePrincipals@v1.0' = {
   appId: actionSpApp.appId
 }
+
+// NOTE: the worker-SP <- sandbox-group-MI Federated Identity Credentials are created
+// by the postprovision hook (az ad app federated-credential create), NOT here — a
+// Bicep FIC unavoidably preflights its parent SP as `existing` before it exists on a
+// clean deploy. See the header note and deployment-gotchas §1.
 
 output mcpAppId string = mcpServerApp.appId
 // Application ID URI the server advertises as its OAuth scope prefix

@@ -7,6 +7,9 @@
 !*.env-sample
 !.env.sample.ollama
 
+# azd (holds per-env config incl. secrets in .azure/<env>/.env)
+.azure/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -29,3 +32,4 @@ node_modules/
 # Bicep
 *.bicep.json
 Conversation History
+post

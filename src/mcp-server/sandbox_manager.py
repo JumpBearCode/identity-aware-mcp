@@ -190,7 +190,7 @@ class SandboxManager:
             distributed_lock=os.environ.get("SANDBOX_DISTRIBUTED_LOCK", "0") == "1",
             lock_ttl=int(os.environ.get("SANDBOX_LOCK_TTL", "60")),
             lock_wait=float(os.environ.get("SANDBOX_LOCK_WAIT", "45")),
-            create_timeout=float(os.environ.get("SANDBOX_CREATE_TIMEOUT", "30")),
+            create_timeout=float(os.environ.get("SANDBOX_CREATE_TIMEOUT", "45")),
             reaper_lease=int(os.environ.get("SANDBOX_REAPER_LEASE", "90")),
         )
 

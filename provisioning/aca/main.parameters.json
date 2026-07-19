@@ -1,0 +1,31 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": { "value": "${AZURE_ENV_NAME}" },
+    "location": { "value": "${AZURE_LOCATION}" },
+    "mcpAppExists": { "value": "${SERVICE_MCP_RESOURCE_EXISTS=false}" },
+    "mcpClientSecret": { "value": "${MCP_CLIENT_SECRET=}" },
+
+    "sandboxImage": { "value": "${SANDBOX_IMAGE=}" },
+    "sandboxDistributedLock": { "value": "${SANDBOX_DISTRIBUTED_LOCK=}" },
+    "mcpExecTimeout": { "value": "${MCP_EXEC_TIMEOUT=}" },
+    "maxOutputBytes": { "value": "${MAX_OUTPUT_BYTES=}" },
+    "mcpSessionTtl": { "value": "${MCP_SESSION_TTL=}" },
+    "mcpProxyEnabled": { "value": "${MCPPROXY_ENABLED=}" },
+    "sandboxAutoSuspendSeconds": { "value": "${SANDBOX_AUTO_SUSPEND_SECONDS=}" },
+    "sandboxAutoDeleteSeconds": { "value": "${SANDBOX_AUTO_DELETE_SECONDS=}" },
+    "sandboxReaperInterval": { "value": "${SANDBOX_REAPER_INTERVAL=}" },
+    "sandboxReaperLease": { "value": "${SANDBOX_REAPER_LEASE=}" },
+    "sandboxLockTtl": { "value": "${SANDBOX_LOCK_TTL=}" },
+    "sandboxLockWait": { "value": "${SANDBOX_LOCK_WAIT=}" },
+    "sandboxCreateTimeout": { "value": "${SANDBOX_CREATE_TIMEOUT=}" },
+    "sandboxCpu": { "value": "${SANDBOX_CPU=}" },
+    "sandboxMemory": { "value": "${SANDBOX_MEMORY=}" },
+    "sandboxDisk": { "value": "${SANDBOX_DISK=}" },
+    "sandboxDiskId": { "value": "${SANDBOX_DISK_ID=}" },
+    "blobMountpoint": { "value": "${BLOB_MOUNTPOINT=}" },
+    "auditTimeout": { "value": "${AUDIT_TIMEOUT=}" },
+    "auditUaIncludeOid": { "value": "${AUDIT_UA_INCLUDE_OID=}" }
+  }
+}

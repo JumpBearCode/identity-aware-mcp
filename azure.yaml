@@ -1,0 +1,34 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/Azure/azure-dev/main/schemas/v1.0/azure.yaml.json
+#
+# `azd up` for the ACA (cloud) path only — EXECUTOR=aca.
+#   provision : provisioning/aca/main.bicep (subscription scope, creates its own RG)
+#   deploy    : builds src/mcp-server and swaps it into the MCP Container App
+#               (found via the `azd-service-name: mcp` tag in mcp-app.bicep)
+#   hooks     : postprovision builds the sandbox image into ACR + injects the
+#               MCP OBO client secret (once) + prints the group-membership step.
+#
+# The local docker path (provisioning/local + docker-compose) is NOT azd-managed.
+name: identity-aware-mcp
+metadata:
+  template: identity-aware-mcp@0.1
+
+infra:
+  provider: bicep
+  path: provisioning/aca
+  module: main
+
+services:
+  mcp:
+    project: src/mcp-server
+    language: docker
+    host: containerapp
+    docker:
+      path: Dockerfile
+      remoteBuild: true          # build in ACR — no local docker daemon needed
+
+hooks:
+  postprovision:
+    shell: sh
+    run: provisioning/aca/hooks/postprovision.sh
+    continueOnError: false
+    interactive: false

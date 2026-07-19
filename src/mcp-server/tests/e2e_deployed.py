@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import pathlib
 import sys
 import uuid
 
@@ -53,9 +54,42 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 # --------------------------------------------------------------------- config
-MCP_SERVER_URL = os.environ.get(
-    "MCP_SERVER_URL",
-    "https://dataops-aca-mcp.icyrock-96f978c0.westus2.azurecontainerapps.io/mcp",
+def _load_azd_env() -> None:
+    """Populate os.environ from the azd environment (.azure/<env>/.env), which is
+    the single source of truth for a deployed stack — there is no .env.aca anymore.
+    Real shell env still wins (os.environ.setdefault), so an explicit override like
+    `MCP_SERVER_URL=... python e2e_deployed.py` keeps working. No-op if azd isn't
+    set up on this machine."""
+    here = pathlib.Path(__file__).resolve()
+    azure_dir = next((p / ".azure" for p in here.parents if (p / ".azure").is_dir()), None)
+    if azure_dir is None:
+        return
+    config = azure_dir / "config.json"
+    if not config.is_file():
+        return
+    try:
+        env_name = json.loads(config.read_text()).get("defaultEnvironment")
+    except (OSError, json.JSONDecodeError):
+        return
+    env_file = azure_dir / (env_name or "") / ".env"
+    if not env_file.is_file():
+        return
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        os.environ.setdefault(key.strip(), val.strip().strip('"'))
+
+
+_load_azd_env()
+
+# Prefer an explicit override, else derive from the deployed server's FQDN
+# (azd output MCP_FQDN), else the last-known dev default.
+_fqdn = os.environ.get("MCP_FQDN")
+MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL") or (
+    f"https://{_fqdn}/mcp" if _fqdn
+    else "https://dataops-aca-mcp.icyrock-96f978c0.westus2.azurecontainerapps.io/mcp"
 )
 TENANT_ID = os.environ.get("AZURE_TENANT_ID", "9ea91fbb-1313-4312-a601-b6d9ab7d4de3")
 MCP_APP_ID = os.environ.get("MCP_APP_ID", "88de6a37-cf75-40d3-83e8-44c5ccbc0895")
